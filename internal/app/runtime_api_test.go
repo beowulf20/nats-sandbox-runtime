@@ -384,6 +384,32 @@ func TestRuntimeAPIHTTPWorkspaceHandlersKeepBusyExpiredWorkspace(t *testing.T) {
 	}
 }
 
+func TestRuntimeWorkspaceBeginRemovesExpiredImageBeforeReuse(t *testing.T) {
+	workspaces := NewRuntimeWorkspaceManager(t.TempDir())
+	lease, err := workspaces.Begin("thread-a")
+	if err != nil {
+		t.Fatalf("Begin workspace returned error: %v", err)
+	}
+	writeRuntimeAPITestFile(t, lease.ImagePath, "stale workspace")
+	lease.Release()
+	expiredAt := time.Now().Add(-runtimeWorkspaceTTL - time.Minute)
+	if err := os.Chtimes(lease.ImagePath, expiredAt, expiredAt); err != nil {
+		t.Fatalf("Chtimes workspace returned error: %v", err)
+	}
+
+	reused, err := workspaces.Begin("thread-a")
+	if err != nil {
+		t.Fatalf("Begin expired workspace returned error: %v", err)
+	}
+	defer reused.Release()
+	if _, err := os.Stat(reused.ImagePath); !os.IsNotExist(err) {
+		t.Fatalf("expired workspace image stat err = %v, want removed before sync", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(reused.ImagePath), runtimeWorkspaceKeyFile)); err != nil {
+		t.Fatalf("workspace key file stat returned error: %v, want workspace metadata recreated", err)
+	}
+}
+
 func TestRuntimeAPIHTTPStorageRejectsBusyWorkerReset(t *testing.T) {
 	cfg := defaultRuntimePythonConfig()
 	cfg.MaxParallel = 1

@@ -68,6 +68,10 @@ func (m *RuntimeWorkspaceManager) Begin(key string) (RuntimeWorkspaceLease, erro
 		release()
 		return RuntimeWorkspaceLease{}, err
 	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		release()
+		return RuntimeWorkspaceLease{}, fmt.Errorf("create workspace dir: %w", err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, runtimeWorkspaceKeyFile), []byte(key+"\n"), 0o644); err != nil {
 		release()
 		return RuntimeWorkspaceLease{}, fmt.Errorf("write workspace key: %w", err)
