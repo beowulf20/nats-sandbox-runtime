@@ -152,7 +152,7 @@ func TestRuntimePythonCommandAcceptsServiceConfig(t *testing.T) {
 		got = cfg
 		return nil
 	})
-	cmd.SetArgs([]string{"runtime", "python", "--url", "nats://demo:4222", "--bucket", "PY", "--max-parallel", "3", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "20s", "--truncate-log-mib", "2"})
+	cmd.SetArgs([]string{"runtime", "python", "--url", "nats://demo:4222", "--bucket", "PY", "--workers", "3", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "20s", "--truncate-log-mib", "2"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute returned error: %v", err)
@@ -181,12 +181,71 @@ func TestRuntimePythonCommandAcceptsServiceConfig(t *testing.T) {
 	}
 }
 
-func TestRuntimePythonCommandRejectsInvalidMaxParallel(t *testing.T) {
+func TestRuntimeAPICommandAcceptsServiceAndHTTPConfig(t *testing.T) {
+	var got RuntimeAPIConfig
+	cmd := NewRootCommandWithRuntimeAPI(nil, nil, nil, func(ctx context.Context, cfg RuntimeAPIConfig) error {
+		got = cfg
+		return nil
+	})
+	cmd.SetArgs([]string{"runtime", "api", "--listen", "127.0.0.1:9090", "--web-dir", "web/build", "--url", "nats://demo:4222", "--bucket", "PY", "--workers", "3", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "20s", "--truncate-log-mib", "2"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if got.Listen != "127.0.0.1:9090" {
+		t.Fatalf("Listen = %q, want override", got.Listen)
+	}
+	if got.WebDir != "web/build" {
+		t.Fatalf("WebDir = %q, want override", got.WebDir)
+	}
+	if got.Runtime.URL != "nats://demo:4222" {
+		t.Fatalf("URL = %q, want override", got.Runtime.URL)
+	}
+	if got.Runtime.Bucket != "PY" {
+		t.Fatalf("Bucket = %q, want override", got.Runtime.Bucket)
+	}
+	if got.Runtime.MaxParallel != 3 {
+		t.Fatalf("MaxParallel = %d, want 3", got.Runtime.MaxParallel)
+	}
+	if got.Runtime.LocalPython.MemoryMiB != 256 {
+		t.Fatalf("MemoryMiB = %d, want 256", got.Runtime.LocalPython.MemoryMiB)
+	}
+	if got.Runtime.LocalPython.WorkspaceMiB != 32 {
+		t.Fatalf("WorkspaceMiB = %d, want 32", got.Runtime.LocalPython.WorkspaceMiB)
+	}
+	if got.Runtime.LocalPython.ExecTimeout != 20*time.Second {
+		t.Fatalf("ExecTimeout = %s, want 20s", got.Runtime.LocalPython.ExecTimeout)
+	}
+	if got.Runtime.TruncateLogMiB != 2 {
+		t.Fatalf("TruncateLogMiB = %d, want 2", got.Runtime.TruncateLogMiB)
+	}
+}
+
+func TestRuntimeAPICommandRejectsInvalidConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"runtime", "api", "--listen", ""},
+		{"runtime", "api", "--web-dir", ""},
+		{"runtime", "api", "--workers", "0"},
+	} {
+		cmd := NewRootCommandWithRuntimeAPI(nil, nil, nil, func(ctx context.Context, cfg RuntimeAPIConfig) error {
+			t.Fatalf("runner should not be called for invalid config")
+			return nil
+		})
+		cmd.SetArgs(args)
+
+		if err := cmd.Execute(); err == nil {
+			t.Fatalf("Execute(%v) returned nil, want error", args)
+		}
+	}
+}
+
+func TestRuntimePythonCommandRejectsInvalidWorkers(t *testing.T) {
 	cmd := NewRootCommand(nil, nil, func(ctx context.Context, cfg RuntimePythonConfig) error {
 		t.Fatalf("runner should not be called for invalid config")
 		return nil
 	})
-	cmd.SetArgs([]string{"runtime", "python", "--max-parallel", "0"})
+	cmd.SetArgs([]string{"runtime", "python", "--workers", "0"})
 
 	if err := cmd.Execute(); err == nil {
 		t.Fatal("Execute returned nil, want error")

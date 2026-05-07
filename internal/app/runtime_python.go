@@ -23,6 +23,13 @@ const (
 	runtimePythonServiceVersion     = "0.0.1"
 	runtimePythonServiceDescription = "Runs Python code in a Firecracker microVM"
 	runtimePythonEndpointSubject    = "python.run"
+
+	runtimePythonControlSettingsGetSubject    = "python.control.settings.get"
+	runtimePythonControlSettingsSetSubject    = "python.control.settings.set"
+	runtimePythonControlSettingsDeleteSubject = "python.control.settings.delete"
+	runtimePythonControlSettingsListSubject   = "python.control.settings.list"
+	runtimePythonControlWorkersSetSubject     = "python.control.workers.set"
+	runtimePythonControlWorkersListSubject    = "python.control.workers.list"
 )
 
 type PythonRunRequest struct {
@@ -50,6 +57,7 @@ type PythonRunResponse struct {
 	WorkspaceMiB    int64               `json:"workspace_mib"`
 	ArtifactBucket  string              `json:"artifact_bucket"`
 	Artifacts       []PythonRunArtifact `json:"artifacts"`
+	WorkerID        string              `json:"worker_id,omitempty"`
 	StdoutHeader    string              `json:"stdout_header"`
 	StderrHeader    string              `json:"stderr_header"`
 	StdoutTruncated bool                `json:"stdout_truncated"`
@@ -64,44 +72,81 @@ type PythonRunArtifact struct {
 }
 
 type runtimePythonService struct {
-	cfg       RuntimePythonConfig
-	store     jetstream.ObjectStore
-	semaphore chan struct{}
+	cfg          RuntimePythonConfig
+	store        jetstream.ObjectStore
+	controlPlane *RuntimeControlPlane
+	workerPool   *RuntimeWorkerPool
 }
 
 func RunRuntimePython(ctx context.Context, cfg RuntimePythonConfig, out io.Writer) error {
+	registration, err := startRuntimePythonService(ctx, cfg, NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), cfg.LocalPython))
+	if err != nil {
+		return err
+	}
+	defer registration.Close()
+	fmt.Fprintf(out, "ready: service=%s endpoint=%s url=%s bucket=%s workers=%d\n", runtimePythonServiceName, runtimePythonEndpointSubject, cfg.URL, cfg.Bucket, cfg.MaxParallel)
+	<-ctx.Done()
+	return nil
+}
+
+type runtimePythonRegistration struct {
+	conn    *nats.Conn
+	service micro.Service
+	runtime *runtimePythonService
+}
+
+func (r *runtimePythonRegistration) Close() {
+	if r.service != nil {
+		_ = r.service.Stop()
+	}
+	if r.conn != nil {
+		r.conn.Close()
+	}
+}
+
+func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, controlPlane *RuntimeControlPlane) (*runtimePythonRegistration, error) {
 	if cfg.URL == "" {
-		return fmt.Errorf("url must not be empty")
+		return nil, fmt.Errorf("url must not be empty")
 	}
 	if cfg.Bucket == "" {
-		return fmt.Errorf("bucket must not be empty")
+		return nil, fmt.Errorf("bucket must not be empty")
 	}
 	if cfg.MaxParallel < 1 {
-		return fmt.Errorf("max-parallel must be at least 1")
+		return nil, fmt.Errorf("workers must be at least 1")
 	}
 	if err := validateLocalPythonConfig(cfg.LocalPython); err != nil {
-		return err
+		return nil, err
 	}
 	nc, err := nats.Connect(cfg.URL, nats.Name("python-runtime-service"))
 	if err != nil {
-		return fmt.Errorf("connect nats: %w", err)
+		return nil, fmt.Errorf("connect nats: %w", err)
 	}
-	defer nc.Close()
 	js, err := jetstream.New(nc)
 	if err != nil {
-		return fmt.Errorf("create jetstream context: %w", err)
+		nc.Close()
+		return nil, fmt.Errorf("create jetstream context: %w", err)
 	}
 	store, err := js.CreateOrUpdateObjectStore(ctx, jetstream.ObjectStoreConfig{
 		Bucket:      cfg.Bucket,
 		Description: "Python runtime workspace artifacts",
 	})
 	if err != nil {
-		return fmt.Errorf("create object store %q: %w", cfg.Bucket, err)
+		nc.Close()
+		return nil, fmt.Errorf("create object store %q: %w", cfg.Bucket, err)
+	}
+	if controlPlane == nil {
+		controlPlane = NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), cfg.LocalPython)
+	}
+	workerPool, err := NewRuntimeWorkerPool(cfg)
+	if err != nil {
+		nc.Close()
+		return nil, err
 	}
 	runtime := &runtimePythonService{
-		cfg:       cfg,
-		store:     store,
-		semaphore: make(chan struct{}, cfg.MaxParallel),
+		cfg:          cfg,
+		store:        store,
+		controlPlane: controlPlane,
+		workerPool:   workerPool,
 	}
 	srv, err := micro.AddService(nc, micro.Config{
 		Name:        runtimePythonServiceName,
@@ -109,25 +154,60 @@ func RunRuntimePython(ctx context.Context, cfg RuntimePythonConfig, out io.Write
 		Description: runtimePythonServiceDescription,
 	})
 	if err != nil {
-		return fmt.Errorf("add runtime service: %w", err)
+		nc.Close()
+		return nil, fmt.Errorf("add runtime service: %w", err)
 	}
-	defer func() { _ = srv.Stop() }()
 	if err := srv.AddEndpoint("run", micro.HandlerFunc(runtime.handleRun), micro.WithEndpointSubject(runtimePythonEndpointSubject)); err != nil {
-		return fmt.Errorf("add runtime endpoint: %w", err)
+		_ = srv.Stop()
+		nc.Close()
+		return nil, fmt.Errorf("add runtime endpoint: %w", err)
 	}
-	fmt.Fprintf(out, "ready: service=%s endpoint=%s url=%s bucket=%s max_parallel=%d\n", runtimePythonServiceName, runtimePythonEndpointSubject, cfg.URL, cfg.Bucket, cfg.MaxParallel)
-	<-ctx.Done()
+	if err := registerRuntimePythonControlPlaneEndpoints(srv, runtime); err != nil {
+		_ = srv.Stop()
+		nc.Close()
+		return nil, err
+	}
+	return &runtimePythonRegistration{conn: nc, service: srv, runtime: runtime}, nil
+}
+
+func registerRuntimePythonControlPlaneEndpoints(srv micro.Service, runtime *runtimePythonService) error {
+	endpoints := []struct {
+		name    string
+		subject string
+		handler micro.HandlerFunc
+	}{
+		{name: "control-settings-get", subject: runtimePythonControlSettingsGetSubject, handler: runtime.handleControlSettingsGet},
+		{name: "control-settings-set", subject: runtimePythonControlSettingsSetSubject, handler: runtime.handleControlSettingsSet},
+		{name: "control-settings-delete", subject: runtimePythonControlSettingsDeleteSubject, handler: runtime.handleControlSettingsDelete},
+		{name: "control-settings-list", subject: runtimePythonControlSettingsListSubject, handler: runtime.handleControlSettingsList},
+		{name: "control-workers-set", subject: runtimePythonControlWorkersSetSubject, handler: runtime.handleControlWorkersSet},
+		{name: "control-workers-list", subject: runtimePythonControlWorkersListSubject, handler: runtime.handleControlWorkersList},
+	}
+	for _, endpoint := range endpoints {
+		if err := srv.AddEndpoint(endpoint.name, endpoint.handler, micro.WithEndpointSubject(endpoint.subject)); err != nil {
+			return fmt.Errorf("add runtime endpoint %s: %w", endpoint.subject, err)
+		}
+	}
 	return nil
 }
 
 func (s *runtimePythonService) handleRun(req micro.Request) {
-	select {
-	case s.semaphore <- struct{}{}:
-		defer func() { <-s.semaphore }()
-	default:
+	workerPool := s.workerPool
+	if workerPool == nil {
+		var err error
+		workerPool, err = NewRuntimeWorkerPool(s.cfg)
+		if err != nil {
+			_ = req.Error("500", err.Error(), nil)
+			return
+		}
+		s.workerPool = workerPool
+	}
+	worker, ok := workerPool.AcquireWorker()
+	if !ok {
 		_ = req.Error("503", "python runtime is busy", nil)
 		return
 	}
+	defer workerPool.ReleaseWorker(worker.ID)
 	var runReq PythonRunRequest
 	if len(req.Data()) > 0 {
 		if err := json.Unmarshal(req.Data(), &runReq); err != nil {
@@ -135,7 +215,7 @@ func (s *runtimePythonService) handleRun(req micro.Request) {
 			return
 		}
 	}
-	resp, stdout, stderr, err := s.run(req, runReq)
+	resp, stdout, stderr, err := s.run(req, worker, runReq)
 	if err != nil {
 		headers := s.logHeaders(stdout, stderr)
 		_ = req.Error("500", err.Error(), nil, micro.WithHeaders(micro.Headers(headers)))
@@ -145,7 +225,7 @@ func (s *runtimePythonService) handleRun(req micro.Request) {
 	_ = req.RespondJSON(resp, micro.WithHeaders(micro.Headers(headers)))
 }
 
-func (s *runtimePythonService) run(_ micro.Request, runReq PythonRunRequest) (PythonRunResponse, []byte, []byte, error) {
+func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq PythonRunRequest) (PythonRunResponse, []byte, []byte, error) {
 	ctx := context.Background()
 	runID := runReq.RunID
 	if runID == "" {
@@ -177,7 +257,7 @@ func (s *runtimePythonService) run(_ micro.Request, runReq PythonRunRequest) (Py
 	}
 	startMarker := "__NATS_SERVICE_TESTS_RUNTIME_STDOUT_START_" + sanitizeRunIDForMarker(runID) + "__"
 	endMarker := "__NATS_SERVICE_TESTS_RUNTIME_STDOUT_END_" + sanitizeRunIDForMarker(runID) + "__"
-	cfg, err := s.localPythonConfigForRun(runReq, workDir, workspaceDir, wrapRuntimePythonCode(code, startMarker, endMarker))
+	cfg, err := s.localPythonConfigForRun(worker, runReq, workDir, workspaceDir, wrapRuntimePythonCode(code, startMarker, endMarker))
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, err
 	}
@@ -199,6 +279,7 @@ func (s *runtimePythonService) run(_ micro.Request, runReq PythonRunRequest) (Py
 		WorkspaceMiB:   cfg.WorkspaceMiB,
 		ArtifactBucket: s.cfg.Bucket,
 		Artifacts:      artifacts,
+		WorkerID:       worker.ID,
 		StdoutHeader:   s.cfg.StdoutHeader,
 		StderrHeader:   s.cfg.StderrHeader,
 	}
@@ -207,15 +288,42 @@ func (s *runtimePythonService) run(_ micro.Request, runReq PythonRunRequest) (Py
 	return response, stdout, result.Stderr, nil
 }
 
-func (s *runtimePythonService) localPythonConfigForRun(runReq PythonRunRequest, workDir, workspaceDir, code string) (LocalPythonConfig, error) {
+func (s *runtimePythonService) localPythonConfigForRun(worker RuntimeWorker, runReq PythonRunRequest, workDir, workspaceDir, code string) (LocalPythonConfig, error) {
 	cfg := s.cfg.LocalPython
+	var err error
+	if s.controlPlane != nil {
+		cfg, err = s.controlPlane.ApplyToLocalPythonConfig(context.Background(), cfg)
+		if err != nil {
+			return LocalPythonConfig{}, err
+		}
+	}
 	cfg.InlineCommand = code
 	cfg.ExecFilePath = ""
 	cfg.WorkspaceDir = workspaceDir
-	cfg.SnapshotDir = filepath.Join(workDir, "snapshot")
+	if worker.SnapshotDir != "" {
+		cfg.SnapshotDir = worker.SnapshotDir
+	} else {
+		cfg.SnapshotDir = filepath.Join(workDir, "snapshot")
+	}
 	cfg.Runs = 1
 	cfg.ParallelRuns = 1
 	cfg.HideFirecrackerLog = true
+	if worker.MemoryMiB != nil {
+		cfg.MemoryMiB = *worker.MemoryMiB
+	}
+	if worker.SwapMiB != nil {
+		cfg.SwapMiB = *worker.SwapMiB
+	}
+	if worker.WorkspaceMiB != nil {
+		cfg.WorkspaceMiB = *worker.WorkspaceMiB
+	}
+	if worker.ExecTimeout != "" {
+		timeout, err := time.ParseDuration(worker.ExecTimeout)
+		if err != nil {
+			return LocalPythonConfig{}, fmt.Errorf("invalid worker exec_timeout %q: %w", worker.ExecTimeout, err)
+		}
+		cfg.ExecTimeout = timeout
+	}
 	if runReq.MemoryMiB > 0 {
 		cfg.MemoryMiB = runReq.MemoryMiB
 	}

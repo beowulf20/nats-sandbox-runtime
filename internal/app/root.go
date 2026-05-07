@@ -11,20 +11,22 @@ import (
 const LocalNATSURL = "nats://localhost:4222"
 
 const (
-	defaultLocalKernelPath = "firecracker-assets/vmlinux.bin"
-	defaultLocalRootfsPath = "firecracker-assets/rootfs.ext4"
-	defaultFirecrackerPath = "bin/firecracker"
-	defaultSnapshotDir     = "firecracker-assets/python-snapshot"
-	defaultWorkspaceDir    = "tmp/workspace"
-	defaultLocalMemoryMiB  = 128
-	defaultLocalVCPUs      = 1
-	defaultMaxVCPUs        = 1
-	defaultExecTimeout     = 5 * time.Second
-	defaultSwapMiB         = 0
-	defaultParallelRuns    = 1
-	defaultWorkspaceMiB    = 16
-	defaultRuntimeBucket   = "python-runtime-workspaces"
-	defaultMaxParallelRuns = 1
+	defaultLocalKernelPath  = "firecracker-assets/vmlinux.bin"
+	defaultLocalRootfsPath  = "firecracker-assets/rootfs.ext4"
+	defaultFirecrackerPath  = "bin/firecracker"
+	defaultSnapshotDir      = "firecracker-assets/python-snapshot"
+	defaultWorkspaceDir     = "tmp/workspace"
+	defaultLocalMemoryMiB   = 128
+	defaultLocalVCPUs       = 1
+	defaultMaxVCPUs         = 1
+	defaultExecTimeout      = 5 * time.Second
+	defaultSwapMiB          = 0
+	defaultParallelRuns     = 1
+	defaultWorkspaceMiB     = 16
+	defaultRuntimeBucket    = "python-runtime-workspaces"
+	defaultMaxParallelRuns  = 1
+	defaultRuntimeAPIListen = "127.0.0.1:8080"
+	defaultRuntimeAPIWebDir = "web/build"
 )
 
 type Config struct {
@@ -61,14 +63,24 @@ type RuntimePythonConfig struct {
 	TruncateLogMiB int64
 }
 
+type RuntimeAPIConfig struct {
+	Listen  string
+	WebDir  string
+	Runtime RuntimePythonConfig
+}
+
 func NewRootCommand(run func(Config) error, runLocalPython func(context.Context, LocalPythonConfig) error, runRuntimePython ...func(context.Context, RuntimePythonConfig) error) *cobra.Command {
-	cfg := Config{
-		Instances: 1,
-		URL:       LocalNATSURL,
-	}
 	var runtimeRunner func(context.Context, RuntimePythonConfig) error
 	if len(runRuntimePython) > 0 {
 		runtimeRunner = runRuntimePython[0]
+	}
+	return NewRootCommandWithRuntimeAPI(run, runLocalPython, runtimeRunner, nil)
+}
+
+func NewRootCommandWithRuntimeAPI(run func(Config) error, runLocalPython func(context.Context, LocalPythonConfig) error, runRuntimePython func(context.Context, RuntimePythonConfig) error, runRuntimeAPI func(context.Context, RuntimeAPIConfig) error) *cobra.Command {
+	cfg := Config{
+		Instances: 1,
+		URL:       LocalNATSURL,
 	}
 
 	cmd := &cobra.Command{
@@ -89,7 +101,7 @@ func NewRootCommand(run func(Config) error, runLocalPython func(context.Context,
 
 	cmd.Flags().IntVarP(&cfg.Instances, "instances", "i", cfg.Instances, "number of service instances to register")
 	cmd.AddCommand(newLocalCommand(runLocalPython))
-	cmd.AddCommand(newRuntimeCommand(runtimeRunner))
+	cmd.AddCommand(newRuntimeCommand(runRuntimePython, runRuntimeAPI))
 
 	return cmd
 }
@@ -198,19 +210,72 @@ func addLocalPythonFlags(cmd *cobra.Command, cfg *LocalPythonConfig) {
 	cmd.Flags().DurationVar(&cfg.ExecTimeout, "exec-timeout", cfg.ExecTimeout, "maximum time to wait for Python exec completion in benchmark runs")
 }
 
-func newRuntimeCommand(runRuntimePython func(context.Context, RuntimePythonConfig) error) *cobra.Command {
+func newRuntimeCommand(runRuntimePython func(context.Context, RuntimePythonConfig) error, runRuntimeAPI func(context.Context, RuntimeAPIConfig) error) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "runtime",
 		Short: "Run NATS-backed runtimes",
 	}
 	cmd.AddCommand(newRuntimePythonCommand(runRuntimePython))
+	cmd.AddCommand(newRuntimeAPICommand(runRuntimeAPI))
 	return cmd
 }
 
 func newRuntimePythonCommand(runRuntimePython func(context.Context, RuntimePythonConfig) error) *cobra.Command {
+	runtimeCfg := defaultRuntimePythonConfig()
+
+	cmd := &cobra.Command{
+		Use:   "python",
+		Short: "Run a NATS service that executes Python in Firecracker",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateRuntimePythonConfig(runtimeCfg); err != nil {
+				return err
+			}
+			if runRuntimePython == nil {
+				return fmt.Errorf("runtime python runner is not configured")
+			}
+			return runRuntimePython(cmd.Context(), runtimeCfg)
+		},
+	}
+	addRuntimePythonFlags(cmd, &runtimeCfg)
+	return cmd
+}
+
+func newRuntimeAPICommand(runRuntimeAPI func(context.Context, RuntimeAPIConfig) error) *cobra.Command {
+	cfg := RuntimeAPIConfig{
+		Listen:  defaultRuntimeAPIListen,
+		WebDir:  defaultRuntimeAPIWebDir,
+		Runtime: defaultRuntimePythonConfig(),
+	}
+
+	cmd := &cobra.Command{
+		Use:   "api",
+		Short: "Run the Python runtime with a local API and web console",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cfg.Listen == "" {
+				return fmt.Errorf("listen must not be empty")
+			}
+			if cfg.WebDir == "" {
+				return fmt.Errorf("web-dir must not be empty")
+			}
+			if err := validateRuntimePythonConfig(cfg.Runtime); err != nil {
+				return err
+			}
+			if runRuntimeAPI == nil {
+				return fmt.Errorf("runtime api runner is not configured")
+			}
+			return runRuntimeAPI(cmd.Context(), cfg)
+		},
+	}
+	cmd.Flags().StringVar(&cfg.Listen, "listen", cfg.Listen, "local HTTP listen address for the runtime API and web console")
+	cmd.Flags().StringVar(&cfg.WebDir, "web-dir", cfg.WebDir, "built Horizon frontend directory to serve")
+	addRuntimePythonFlags(cmd, &cfg.Runtime)
+	return cmd
+}
+
+func defaultRuntimePythonConfig() RuntimePythonConfig {
 	localCfg := defaultLocalPythonConfig()
 	localCfg.HideFirecrackerLog = true
-	runtimeCfg := RuntimePythonConfig{
+	return RuntimePythonConfig{
 		URL:            LocalNATSURL,
 		Bucket:         defaultRuntimeBucket,
 		MaxParallel:    defaultMaxParallelRuns,
@@ -219,29 +284,25 @@ func newRuntimePythonCommand(runRuntimePython func(context.Context, RuntimePytho
 		StderrHeader:   "Nats-Service-Tests-Python-Stderr-B64",
 		TruncateLogMiB: 1,
 	}
+}
 
-	cmd := &cobra.Command{
-		Use:   "python",
-		Short: "Run a NATS service that executes Python in Firecracker",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := validateLocalPythonConfig(runtimeCfg.LocalPython); err != nil {
-				return err
-			}
-			if runtimeCfg.MaxParallel < 1 {
-				return fmt.Errorf("max-parallel must be at least 1")
-			}
-			if runtimeCfg.Bucket == "" {
-				return fmt.Errorf("bucket must not be empty")
-			}
-			if runtimeCfg.TruncateLogMiB < 0 {
-				return fmt.Errorf("truncate-log-mib must be at least 0")
-			}
-			if runRuntimePython == nil {
-				return fmt.Errorf("runtime python runner is not configured")
-			}
-			return runRuntimePython(cmd.Context(), runtimeCfg)
-		},
+func validateRuntimePythonConfig(cfg RuntimePythonConfig) error {
+	if err := validateLocalPythonConfig(cfg.LocalPython); err != nil {
+		return err
 	}
+	if cfg.MaxParallel < 1 {
+		return fmt.Errorf("workers must be at least 1")
+	}
+	if cfg.Bucket == "" {
+		return fmt.Errorf("bucket must not be empty")
+	}
+	if cfg.TruncateLogMiB < 0 {
+		return fmt.Errorf("truncate-log-mib must be at least 0")
+	}
+	return nil
+}
+
+func addRuntimePythonFlags(cmd *cobra.Command, runtimeCfg *RuntimePythonConfig) {
 	cmd.Flags().StringVar(&runtimeCfg.LocalPython.KernelPath, "kernel", runtimeCfg.LocalPython.KernelPath, "Firecracker guest kernel path")
 	cmd.Flags().StringVar(&runtimeCfg.LocalPython.RootfsPath, "rootfs", runtimeCfg.LocalPython.RootfsPath, "Firecracker rootfs path")
 	cmd.Flags().StringVar(&runtimeCfg.LocalPython.FirecrackerPath, "firecracker", runtimeCfg.LocalPython.FirecrackerPath, "Firecracker binary path")
@@ -254,9 +315,9 @@ func newRuntimePythonCommand(runRuntimePython func(context.Context, RuntimePytho
 	cmd.Flags().DurationVar(&runtimeCfg.LocalPython.ExecTimeout, "exec-timeout", runtimeCfg.LocalPython.ExecTimeout, "default maximum time to wait for Python exec completion")
 	cmd.Flags().StringVar(&runtimeCfg.URL, "url", runtimeCfg.URL, "NATS server URL")
 	cmd.Flags().StringVar(&runtimeCfg.Bucket, "bucket", runtimeCfg.Bucket, "NATS Object Store bucket for runtime workspaces")
-	cmd.Flags().IntVar(&runtimeCfg.MaxParallel, "max-parallel", runtimeCfg.MaxParallel, "maximum Python runs to execute concurrently")
+	cmd.Flags().IntVar(&runtimeCfg.MaxParallel, "workers", runtimeCfg.MaxParallel, "initial runtime worker count")
+	cmd.Flags().IntVar(&runtimeCfg.MaxParallel, "max-parallel", runtimeCfg.MaxParallel, "deprecated alias for --workers")
 	cmd.Flags().StringVar(&runtimeCfg.StdoutHeader, "stdout-header", runtimeCfg.StdoutHeader, "response header used for base64 stdout metadata")
 	cmd.Flags().StringVar(&runtimeCfg.StderrHeader, "stderr-header", runtimeCfg.StderrHeader, "response header used for base64 stderr metadata")
 	cmd.Flags().Int64Var(&runtimeCfg.TruncateLogMiB, "truncate-log-mib", runtimeCfg.TruncateLogMiB, "maximum stdout/stderr MiB returned in response metadata; 0 disables truncation")
-	return cmd
 }

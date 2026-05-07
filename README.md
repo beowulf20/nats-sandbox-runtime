@@ -132,3 +132,64 @@ The JSON response includes run metrics and uploaded artifact object keys. Stdout
 - `Nats-Service-Tests-Python-Stderr-B64`
 
 The corresponding `*-Truncated` headers indicate whether the metadata was capped by `--truncate-log-mib`. Artifacts are uploaded under `runs/<run_id>/artifacts/<workspace-path>` in the configured bucket.
+
+Runtime execution is handled by a worker pool. At startup, `--workers` sets the initial desired worker count, and each worker owns an isolated snapshot directory under `<snapshot-dir>/workers/<worker-id>`. Requests are assigned to the first idle worker. The desired worker count can be changed while the service is running:
+
+```bash
+nats req python.control.workers.set '{"count":3}'
+nats req python.control.workers.list '{}'
+```
+
+Increasing the count creates workers immediately. Decreasing it removes idle workers first and lets busy excess workers finish their current run before disappearing. Runtime defaults still apply to each worker, and per-run `python.run` resource fields have final precedence.
+
+## Local Runtime API Console
+
+Run the Python runtime and a local Horizon UI console from one process:
+
+```bash
+tmp/go/bin/go run ./cmd/nats-service-tests runtime api --bucket python-runtime-workspaces
+```
+
+The API listens on `127.0.0.1:8080` by default and serves `web/build`. Build the frontend first:
+
+```bash
+cd web
+npm install
+npm run build
+```
+
+Open `http://127.0.0.1:8080` for the console. The lateral navigation includes:
+
+- `Overview`: NATS connection and runtime service status
+- `Workers`: current worker pool status and desired worker count
+- `Settings`: discoverable runtime defaults that affect future Python runs
+
+For local development with reloadable server and UI processes, run:
+
+```bash
+make dev
+```
+
+The dev target runs Air for the Go runtime API on `127.0.0.1:8080` and the React dev server on `127.0.0.1:3000`. The UI dev server proxies `/api/*` requests to the runtime API. Override ports as needed:
+
+```bash
+make dev RUNTIME_API_LISTEN=127.0.0.1:8081 WEB_PORT=3001
+```
+
+The local JSON endpoints are:
+
+- `GET /api/overview`
+- `GET /api/workers`
+- `GET /api/workers/events` for Server-Sent Events with live worker snapshots
+- `PUT /api/workers` with `{"count": <integer>}`
+- `GET /api/settings` for discoverable effective runtime settings
+- `GET /api/settings/{key}`
+- `PUT /api/settings/{key}` with `{"value": <json>}`
+- `DELETE /api/settings/{key}` to reset a known setting to the startup default
+
+Known settings are:
+
+- `runtime.default_memory_mib`
+- `runtime.default_swap_mib`
+- `runtime.default_workspace_mib`
+- `runtime.default_exec_timeout`

@@ -1,7 +1,9 @@
 package app
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -13,7 +15,8 @@ func TestRuntimePythonLocalConfigForRunAppliesRequestOverrides(t *testing.T) {
 		},
 	}
 
-	got, err := service.localPythonConfigForRun(PythonRunRequest{
+	worker := RuntimeWorker{ID: "worker-1", SnapshotDir: "/tmp/worker-1/snapshot"}
+	got, err := service.localPythonConfigForRun(worker, PythonRunRequest{
 		MemoryMiB:    256,
 		SwapMiB:      64,
 		WorkspaceMiB: 32,
@@ -29,8 +32,8 @@ func TestRuntimePythonLocalConfigForRunAppliesRequestOverrides(t *testing.T) {
 	if got.WorkspaceDir != "/tmp/run/workspace" {
 		t.Fatalf("WorkspaceDir = %q, want run workspace", got.WorkspaceDir)
 	}
-	if got.SnapshotDir != "/tmp/run/snapshot" {
-		t.Fatalf("SnapshotDir = %q, want per-run snapshot", got.SnapshotDir)
+	if got.SnapshotDir != "/tmp/worker-1/snapshot" {
+		t.Fatalf("SnapshotDir = %q, want worker snapshot", got.SnapshotDir)
 	}
 	if got.MemoryMiB != 256 || got.SwapMiB != 64 || got.WorkspaceMiB != 32 {
 		t.Fatalf("resources = memory:%d swap:%d workspace:%d, want request overrides", got.MemoryMiB, got.SwapMiB, got.WorkspaceMiB)
@@ -43,10 +46,58 @@ func TestRuntimePythonLocalConfigForRunAppliesRequestOverrides(t *testing.T) {
 	}
 }
 
+func TestRuntimePythonLocalConfigForRunUsesEffectiveControlPlaneDefaults(t *testing.T) {
+	baseCfg := defaultLocalPythonConfig()
+	baseCfg.MemoryMiB = 128
+	baseCfg.SwapMiB = 0
+	baseCfg.WorkspaceMiB = 16
+	baseCfg.ExecTimeout = 5 * time.Second
+	control := NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), baseCfg)
+	ctx := context.Background()
+	if err := control.SetSetting(ctx, "runtime.default_memory_mib", json.RawMessage(`256`)); err != nil {
+		t.Fatalf("SetSetting memory returned error: %v", err)
+	}
+	if err := control.SetSetting(ctx, "runtime.default_swap_mib", json.RawMessage(`32`)); err != nil {
+		t.Fatalf("SetSetting swap returned error: %v", err)
+	}
+	if err := control.SetSetting(ctx, "runtime.default_workspace_mib", json.RawMessage(`64`)); err != nil {
+		t.Fatalf("SetSetting workspace returned error: %v", err)
+	}
+	if err := control.SetSetting(ctx, "runtime.default_exec_timeout", json.RawMessage(`"20s"`)); err != nil {
+		t.Fatalf("SetSetting timeout returned error: %v", err)
+	}
+	service := &runtimePythonService{
+		cfg:          RuntimePythonConfig{LocalPython: baseCfg},
+		controlPlane: control,
+	}
+
+	worker := RuntimeWorker{ID: "worker-1", SnapshotDir: "/tmp/worker-1/snapshot"}
+	got, err := service.localPythonConfigForRun(worker, PythonRunRequest{}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	if err != nil {
+		t.Fatalf("localPythonConfigForRun returned error: %v", err)
+	}
+	if got.MemoryMiB != 256 || got.SwapMiB != 32 || got.WorkspaceMiB != 64 || got.ExecTimeout != 20*time.Second {
+		t.Fatalf("resources = memory:%d swap:%d workspace:%d timeout:%s, want control-plane defaults", got.MemoryMiB, got.SwapMiB, got.WorkspaceMiB, got.ExecTimeout)
+	}
+
+	got, err = service.localPythonConfigForRun(worker, PythonRunRequest{
+		MemoryMiB:    512,
+		SwapMiB:      48,
+		WorkspaceMiB: 96,
+		ExecTimeout:  "30s",
+	}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	if err != nil {
+		t.Fatalf("localPythonConfigForRun with request overrides returned error: %v", err)
+	}
+	if got.MemoryMiB != 512 || got.SwapMiB != 48 || got.WorkspaceMiB != 96 || got.ExecTimeout != 30*time.Second {
+		t.Fatalf("resources = memory:%d swap:%d workspace:%d timeout:%s, want request overrides", got.MemoryMiB, got.SwapMiB, got.WorkspaceMiB, got.ExecTimeout)
+	}
+}
+
 func TestRuntimePythonLocalConfigForRunRejectsInvalidTimeout(t *testing.T) {
 	service := &runtimePythonService{cfg: RuntimePythonConfig{LocalPython: defaultLocalPythonConfig()}}
 
-	_, err := service.localPythonConfigForRun(PythonRunRequest{ExecTimeout: "bogus"}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	_, err := service.localPythonConfigForRun(RuntimeWorker{ID: "worker-1", SnapshotDir: "/tmp/worker-1/snapshot"}, PythonRunRequest{ExecTimeout: "bogus"}, "/tmp/run", "/tmp/run/workspace", "print(42)")
 	if err == nil {
 		t.Fatal("localPythonConfigForRun returned nil, want invalid timeout error")
 	}

@@ -1,0 +1,22 @@
+root = "."
+tmp_dir = "tmp/air"
+
+[build]
+cmd = "tmp/go/bin/go build -buildvcs=false -o ./tmp/air/nats-service-tests ./cmd/nats-service-tests"
+entrypoint = ["sh", "./scripts/run-runtime-api-dev.sh"]
+delay = 1000
+exclude_dir = ["firecracker-assets", "node_modules", "tmp", "web/build", "web/node_modules"]
+exclude_file = []
+exclude_regex = ["_test.go"]
+follow_symlink = false
+include_ext = ["go", "mod", "sum"]
+kill_delay = "500ms"
+log = "air-build.log"
+send_interrupt = true
+stop_on_error = true
+
+[log]
+time = true
+
+[misc]
+clean_on_exit = true

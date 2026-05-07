@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	cmd := app.NewRootCommand(func(cfg app.Config) error {
+	cmd := app.NewRootCommandWithRuntimeAPI(func(cfg app.Config) error {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer stop()
 
@@ -25,6 +25,11 @@ func main() {
 		defer stop()
 
 		return app.RunRuntimePython(ctx, cfg, os.Stdout)
+	}, func(ctx context.Context, cfg app.RuntimeAPIConfig) error {
+		ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+		defer stop()
+
+		return app.RunRuntimeAPI(ctx, cfg, os.Stdout)
 	})
 
 	if err := cmd.Execute(); err != nil {
