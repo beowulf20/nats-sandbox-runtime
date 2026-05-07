@@ -1,4 +1,11 @@
-import type { RuntimeOverview, RuntimeWorker, RuntimeWorkerSetRequest, Setting } from "./types";
+import type {
+  RuntimeOverview,
+  RuntimeSnapshotStatus,
+  RuntimeWorker,
+  RuntimeWorkerSetRequest,
+  RuntimeWorkspaceStatus,
+  Setting,
+} from "./types";
 
 async function requestJSON<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -28,6 +35,28 @@ export function listSettings() {
 
 export function listWorkers() {
   return requestJSON<{ desired_count: number; workers: RuntimeWorker[] }>("/api/workers");
+}
+
+export function listSnapshots() {
+  return requestJSON<{ snapshots: RuntimeSnapshotStatus[] }>("/api/snapshots");
+}
+
+export function resetSnapshot(workerID: string) {
+  return requestJSON<{ worker_id: string; status: string }>(
+    `/api/snapshots/workers/${encodeURIComponent(workerID)}`,
+    { method: "DELETE" }
+  );
+}
+
+export function listWorkspaces() {
+  return requestJSON<{ workspaces: RuntimeWorkspaceStatus[] }>("/api/workspaces");
+}
+
+export function resetWorkspace(key: string) {
+  return requestJSON<{ key: string; status: string }>(
+    `/api/workspaces/${encodeURIComponent(key)}`,
+    { method: "DELETE" }
+  );
 }
 
 export function workerEventsURL() {

@@ -1,10 +1,20 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { FiActivity, FiCpu, FiMenu, FiSettings, FiX } from "react-icons/fi";
+import {
+  FiActivity,
+  FiArchive,
+  FiCpu,
+  FiHardDrive,
+  FiMenu,
+  FiSettings,
+  FiX,
+} from "react-icons/fi";
 import { useState } from "react";
 
 const navItems = [
   { label: "Overview", path: "/overview", icon: FiActivity },
   { label: "Workers", path: "/workers", icon: FiCpu },
+  { label: "Snapshots", path: "/snapshots", icon: FiArchive },
+  { label: "Workspaces", path: "/workspaces", icon: FiHardDrive },
   { label: "Settings", path: "/settings", icon: FiSettings },
 ];
 

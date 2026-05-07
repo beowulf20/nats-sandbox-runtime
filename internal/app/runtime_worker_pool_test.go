@@ -184,7 +184,7 @@ func TestRuntimePythonLocalConfigForRunUsesWorkerSnapshotAndOverrides(t *testing
 	got, err := service.localPythonConfigForRun(worker, PythonRunRequest{
 		WorkspaceMiB: 64,
 		ExecTimeout:  "20s",
-	}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	}, "/tmp/run", "/tmp/run/workspace", "", "print(42)")
 	if err != nil {
 		t.Fatalf("localPythonConfigForRun returned error: %v", err)
 	}

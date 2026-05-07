@@ -17,6 +17,7 @@ func TestRuntimeAPIHTTPOverview(t *testing.T) {
 	handler := newRuntimeAPIHTTPHandler(
 		NewRuntimeControlPlane(NewInMemorySettingsStore()),
 		nil,
+		nil,
 		staticRuntimeAPIOverviewProvider{overview: RuntimeAPIOverviewResponse{
 			NATS: RuntimeAPINATSStatus{
 				URL:           "nats://demo:4222",
@@ -82,6 +83,7 @@ func TestRuntimeAPIHTTPWorkersHandlers(t *testing.T) {
 	handler := newRuntimeAPIHTTPHandler(
 		NewRuntimeControlPlane(NewInMemorySettingsStore()),
 		pool,
+		NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir),
 		staticRuntimeAPIOverviewProvider{},
 		t.TempDir(),
 	)
@@ -126,6 +128,7 @@ func TestRuntimeAPIHTTPWorkerEventsStreamsSnapshots(t *testing.T) {
 	handler := newRuntimeAPIHTTPHandler(
 		NewRuntimeControlPlane(NewInMemorySettingsStore()),
 		pool,
+		NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir),
 		staticRuntimeAPIOverviewProvider{},
 		t.TempDir(),
 	)
@@ -174,6 +177,7 @@ func TestRuntimeAPIHTTPWorkersRejectInvalidRequests(t *testing.T) {
 	handler := newRuntimeAPIHTTPHandler(
 		NewRuntimeControlPlane(NewInMemorySettingsStore()),
 		pool,
+		NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir),
 		staticRuntimeAPIOverviewProvider{},
 		t.TempDir(),
 	)
@@ -194,6 +198,230 @@ func TestRuntimeAPIHTTPWorkersRejectInvalidRequests(t *testing.T) {
 				t.Fatalf("status = %d body = %s, want 400", resp.Code, resp.Body.String())
 			}
 		})
+	}
+}
+
+func TestRuntimeAPIHTTPSnapshotHandlers(t *testing.T) {
+	cfg := defaultRuntimePythonConfig()
+	cfg.MaxParallel = 1
+	cfg.LocalPython.SnapshotDir = filepath.Join(t.TempDir(), "snapshots")
+	pool, err := NewRuntimeWorkerPool(cfg)
+	if err != nil {
+		t.Fatalf("NewRuntimeWorkerPool returned error: %v", err)
+	}
+	worker := pool.ListWorkers()[0]
+	paths := localPythonSnapshotPaths(worker.SnapshotDir)
+	writeRuntimeAPITestFile(t, paths.StatePath, "state")
+	writeRuntimeAPITestFile(t, paths.MemoryPath, "memory")
+	writeRuntimeAPITestFile(t, paths.VersionPath, localPythonSnapshotVersion(cfg.LocalPython)+"\n")
+	writeRuntimeAPITestFile(t, paths.WorkspacePath, "workspace")
+
+	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlane(nil), pool, NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir), staticRuntimeAPIOverviewProvider{}, t.TempDir())
+	listReq := httptest.NewRequest(http.MethodGet, "/api/snapshots", nil)
+	listResp := httptest.NewRecorder()
+	handler.ServeHTTP(listResp, listReq)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("GET snapshots status = %d body = %s, want 200", listResp.Code, listResp.Body.String())
+	}
+	var listBody runtimeSnapshotsResponse
+	if err := json.Unmarshal(listResp.Body.Bytes(), &listBody); err != nil {
+		t.Fatalf("unmarshal snapshots returned error: %v: %s", err, listResp.Body.String())
+	}
+	if len(listBody.Snapshots) != 1 || !listBody.Snapshots[0].OK || listBody.Snapshots[0].Version == "" {
+		t.Fatalf("snapshots = %#v, want one ready snapshot with version", listBody.Snapshots)
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/snapshots/workers/"+worker.ID, nil)
+	deleteResp := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResp, deleteReq)
+	if deleteResp.Code != http.StatusOK {
+		t.Fatalf("DELETE snapshot status = %d body = %s, want 200", deleteResp.Code, deleteResp.Body.String())
+	}
+	for _, path := range []string{paths.StatePath, paths.MemoryPath, paths.VersionPath, paths.SwapPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("snapshot file %s exists after delete, err=%v", path, err)
+		}
+	}
+	if _, err := os.Stat(paths.WorkspacePath); err != nil {
+		t.Fatalf("workspace path after snapshot delete stat err = %v, want still present", err)
+	}
+}
+
+func TestRuntimeAPIHTTPWorkspaceHandlers(t *testing.T) {
+	cfg := defaultRuntimePythonConfig()
+	cfg.MaxParallel = 1
+	cfg.LocalPython.SnapshotDir = filepath.Join(t.TempDir(), "snapshots")
+	cfg.LocalPython.WorkspaceMiB = 32
+	pool, err := NewRuntimeWorkerPool(cfg)
+	if err != nil {
+		t.Fatalf("NewRuntimeWorkerPool returned error: %v", err)
+	}
+	workspaces := NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir)
+	lease, err := workspaces.Begin("thread-a")
+	if err != nil {
+		t.Fatalf("Begin workspace returned error: %v", err)
+	}
+	writeRuntimeAPITestFile(t, lease.ImagePath, "workspace")
+	lease.Release()
+
+	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), cfg.LocalPython), pool, workspaces, staticRuntimeAPIOverviewProvider{}, t.TempDir())
+	listReq := httptest.NewRequest(http.MethodGet, "/api/workspaces", nil)
+	listResp := httptest.NewRecorder()
+	handler.ServeHTTP(listResp, listReq)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("GET workspaces status = %d body = %s, want 200", listResp.Code, listResp.Body.String())
+	}
+	var listBody runtimeWorkspacesResponse
+	if err := json.Unmarshal(listResp.Body.Bytes(), &listBody); err != nil {
+		t.Fatalf("unmarshal workspaces returned error: %v: %s", err, listResp.Body.String())
+	}
+	if len(listBody.Workspaces) != 1 || listBody.Workspaces[0].Key != "thread-a" || !listBody.Workspaces[0].File.Exists || listBody.Workspaces[0].WorkspaceMiB != 32 {
+		t.Fatalf("workspaces = %#v, want one existing 32 MiB thread-a workspace", listBody.Workspaces)
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/workspaces/thread-a", nil)
+	deleteResp := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResp, deleteReq)
+	if deleteResp.Code != http.StatusOK {
+		t.Fatalf("DELETE workspace status = %d body = %s, want 200", deleteResp.Code, deleteResp.Body.String())
+	}
+	if _, err := os.Stat(lease.ImagePath); !os.IsNotExist(err) {
+		t.Fatalf("workspace file exists after delete, err=%v", err)
+	}
+}
+
+func TestRuntimeAPIHTTPWorkspaceHandlersReturnEmptyList(t *testing.T) {
+	cfg := defaultRuntimePythonConfig()
+	cfg.MaxParallel = 1
+	cfg.LocalPython.SnapshotDir = filepath.Join(t.TempDir(), "snapshots")
+	pool, err := NewRuntimeWorkerPool(cfg)
+	if err != nil {
+		t.Fatalf("NewRuntimeWorkerPool returned error: %v", err)
+	}
+	handler := newRuntimeAPIHTTPHandler(
+		NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), cfg.LocalPython),
+		pool,
+		NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir),
+		staticRuntimeAPIOverviewProvider{},
+		t.TempDir(),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/workspaces", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET workspaces status = %d body = %s, want 200", resp.Code, resp.Body.String())
+	}
+	requireJSONEqual(t, resp.Body.Bytes(), `{"workspaces":[]}`)
+}
+
+func TestRuntimeAPIHTTPWorkspaceHandlersPruneExpiredWorkspaces(t *testing.T) {
+	cfg := defaultRuntimePythonConfig()
+	cfg.MaxParallel = 1
+	cfg.LocalPython.SnapshotDir = filepath.Join(t.TempDir(), "snapshots")
+	pool, err := NewRuntimeWorkerPool(cfg)
+	if err != nil {
+		t.Fatalf("NewRuntimeWorkerPool returned error: %v", err)
+	}
+	workspaces := NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir)
+	lease, err := workspaces.Begin("thread-a")
+	if err != nil {
+		t.Fatalf("Begin workspace returned error: %v", err)
+	}
+	writeRuntimeAPITestFile(t, lease.ImagePath, "workspace")
+	lease.Release()
+	expiredAt := time.Now().Add(-runtimeWorkspaceTTL - time.Minute)
+	if err := os.Chtimes(lease.ImagePath, expiredAt, expiredAt); err != nil {
+		t.Fatalf("Chtimes workspace returned error: %v", err)
+	}
+
+	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), cfg.LocalPython), pool, workspaces, staticRuntimeAPIOverviewProvider{}, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/api/workspaces", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET workspaces status = %d body = %s, want 200", resp.Code, resp.Body.String())
+	}
+	requireJSONEqual(t, resp.Body.Bytes(), `{"workspaces":[]}`)
+	if _, err := os.Stat(lease.ImagePath); !os.IsNotExist(err) {
+		t.Fatalf("expired workspace file still exists, err=%v", err)
+	}
+}
+
+func TestRuntimeAPIHTTPWorkspaceHandlersKeepBusyExpiredWorkspace(t *testing.T) {
+	cfg := defaultRuntimePythonConfig()
+	cfg.MaxParallel = 1
+	cfg.LocalPython.SnapshotDir = filepath.Join(t.TempDir(), "snapshots")
+	pool, err := NewRuntimeWorkerPool(cfg)
+	if err != nil {
+		t.Fatalf("NewRuntimeWorkerPool returned error: %v", err)
+	}
+	workspaces := NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir)
+	lease, err := workspaces.Begin("thread-a")
+	if err != nil {
+		t.Fatalf("Begin workspace returned error: %v", err)
+	}
+	defer lease.Release()
+	writeRuntimeAPITestFile(t, lease.ImagePath, "workspace")
+	expiredAt := time.Now().Add(-runtimeWorkspaceTTL - time.Minute)
+	if err := os.Chtimes(lease.ImagePath, expiredAt, expiredAt); err != nil {
+		t.Fatalf("Chtimes workspace returned error: %v", err)
+	}
+
+	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), cfg.LocalPython), pool, workspaces, staticRuntimeAPIOverviewProvider{}, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/api/workspaces", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET workspaces status = %d body = %s, want 200", resp.Code, resp.Body.String())
+	}
+	var body runtimeWorkspacesResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal workspaces returned error: %v: %s", err, resp.Body.String())
+	}
+	if len(body.Workspaces) != 1 || !body.Workspaces[0].Busy {
+		t.Fatalf("workspaces = %#v, want busy expired workspace to remain listed", body.Workspaces)
+	}
+}
+
+func TestRuntimeAPIHTTPStorageRejectsBusyWorkerReset(t *testing.T) {
+	cfg := defaultRuntimePythonConfig()
+	cfg.MaxParallel = 1
+	cfg.LocalPython.SnapshotDir = filepath.Join(t.TempDir(), "snapshots")
+	pool, err := NewRuntimeWorkerPool(cfg)
+	if err != nil {
+		t.Fatalf("NewRuntimeWorkerPool returned error: %v", err)
+	}
+	worker, ok := pool.AcquireWorker()
+	if !ok {
+		t.Fatal("AcquireWorker returned false, want worker")
+	}
+	defer pool.ReleaseWorker(worker.ID)
+	workspaces := NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir)
+	lease, err := workspaces.Begin("thread-a")
+	if err != nil {
+		t.Fatalf("Begin workspace returned error: %v", err)
+	}
+	defer lease.Release()
+	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlane(nil), pool, workspaces, staticRuntimeAPIOverviewProvider{}, t.TempDir())
+
+	for _, path := range []string{"/api/snapshots/workers/" + worker.ID, "/api/workspaces/thread-a"} {
+		req := httptest.NewRequest(http.MethodDelete, path, nil)
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusConflict {
+			t.Fatalf("DELETE %s status = %d body = %s, want 409", path, resp.Code, resp.Body.String())
+		}
+	}
+}
+
+func writeRuntimeAPITestFile(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll %s returned error: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile %s returned error: %v", path, err)
 	}
 }
 
@@ -248,6 +476,7 @@ func TestRuntimeAPIHTTPSettingsHandlers(t *testing.T) {
 	handler := newRuntimeAPIHTTPHandler(
 		NewRuntimeControlPlane(NewInMemorySettingsStore()),
 		nil,
+		nil,
 		staticRuntimeAPIOverviewProvider{},
 		t.TempDir(),
 	)
@@ -299,6 +528,7 @@ func TestRuntimeAPIHTTPSettingsRejectInvalidRequests(t *testing.T) {
 	handler := newRuntimeAPIHTTPHandler(
 		NewRuntimeControlPlane(NewInMemorySettingsStore()),
 		nil,
+		nil,
 		staticRuntimeAPIOverviewProvider{},
 		t.TempDir(),
 	)
@@ -333,7 +563,7 @@ func TestRuntimeAPIHTTPServesStaticBuildAndFallback(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(webDir, "asset.txt"), []byte("asset"), 0o644); err != nil {
 		t.Fatalf("WriteFile asset returned error: %v", err)
 	}
-	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlane(nil), nil, staticRuntimeAPIOverviewProvider{}, webDir)
+	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlane(nil), nil, nil, staticRuntimeAPIOverviewProvider{}, webDir)
 
 	assetReq := httptest.NewRequest(http.MethodGet, "/asset.txt", nil)
 	assetResp := httptest.NewRecorder()
@@ -351,7 +581,7 @@ func TestRuntimeAPIHTTPServesStaticBuildAndFallback(t *testing.T) {
 }
 
 func TestRuntimeAPIHTTPMissingBuildReturnsDevelopmentMessage(t *testing.T) {
-	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlane(nil), nil, staticRuntimeAPIOverviewProvider{}, filepath.Join(t.TempDir(), "missing"))
+	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlane(nil), nil, nil, staticRuntimeAPIOverviewProvider{}, filepath.Join(t.TempDir(), "missing"))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	resp := httptest.NewRecorder()

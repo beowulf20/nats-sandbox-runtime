@@ -21,7 +21,7 @@ func TestRuntimePythonLocalConfigForRunAppliesRequestOverrides(t *testing.T) {
 		SwapMiB:      64,
 		WorkspaceMiB: 32,
 		ExecTimeout:  "12s",
-	}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	}, "/tmp/run", "/tmp/run/workspace", "/tmp/workspaces/run-a/workspace.ext4", "print(42)")
 	if err != nil {
 		t.Fatalf("localPythonConfigForRun returned error: %v", err)
 	}
@@ -31,6 +31,9 @@ func TestRuntimePythonLocalConfigForRunAppliesRequestOverrides(t *testing.T) {
 	}
 	if got.WorkspaceDir != "/tmp/run/workspace" {
 		t.Fatalf("WorkspaceDir = %q, want run workspace", got.WorkspaceDir)
+	}
+	if got.WorkspaceImagePath != "/tmp/workspaces/run-a/workspace.ext4" {
+		t.Fatalf("WorkspaceImagePath = %q, want run workspace image", got.WorkspaceImagePath)
 	}
 	if got.SnapshotDir != "/tmp/worker-1/snapshot" {
 		t.Fatalf("SnapshotDir = %q, want worker snapshot", got.SnapshotDir)
@@ -72,7 +75,7 @@ func TestRuntimePythonLocalConfigForRunUsesEffectiveControlPlaneDefaults(t *test
 	}
 
 	worker := RuntimeWorker{ID: "worker-1", SnapshotDir: "/tmp/worker-1/snapshot"}
-	got, err := service.localPythonConfigForRun(worker, PythonRunRequest{}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	got, err := service.localPythonConfigForRun(worker, PythonRunRequest{}, "/tmp/run", "/tmp/run/workspace", "", "print(42)")
 	if err != nil {
 		t.Fatalf("localPythonConfigForRun returned error: %v", err)
 	}
@@ -85,7 +88,7 @@ func TestRuntimePythonLocalConfigForRunUsesEffectiveControlPlaneDefaults(t *test
 		SwapMiB:      48,
 		WorkspaceMiB: 96,
 		ExecTimeout:  "30s",
-	}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	}, "/tmp/run", "/tmp/run/workspace", "", "print(42)")
 	if err != nil {
 		t.Fatalf("localPythonConfigForRun with request overrides returned error: %v", err)
 	}
@@ -97,9 +100,45 @@ func TestRuntimePythonLocalConfigForRunUsesEffectiveControlPlaneDefaults(t *test
 func TestRuntimePythonLocalConfigForRunRejectsInvalidTimeout(t *testing.T) {
 	service := &runtimePythonService{cfg: RuntimePythonConfig{LocalPython: defaultLocalPythonConfig()}}
 
-	_, err := service.localPythonConfigForRun(RuntimeWorker{ID: "worker-1", SnapshotDir: "/tmp/worker-1/snapshot"}, PythonRunRequest{ExecTimeout: "bogus"}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	_, err := service.localPythonConfigForRun(RuntimeWorker{ID: "worker-1", SnapshotDir: "/tmp/worker-1/snapshot"}, PythonRunRequest{ExecTimeout: "bogus"}, "/tmp/run", "/tmp/run/workspace", "", "print(42)")
 	if err == nil {
 		t.Fatal("localPythonConfigForRun returned nil, want invalid timeout error")
+	}
+}
+
+func TestRuntimeWorkspaceKeyOnlyPersistsWithThreadID(t *testing.T) {
+	if got := runtimeWorkspaceKey(PythonRunRequest{RunID: "run-a"}, "run-a"); got != "" {
+		t.Fatalf("runtimeWorkspaceKey without thread_id = %q, want empty ephemeral key", got)
+	}
+	if got := runtimeWorkspaceKey(PythonRunRequest{RunID: "run-a", ThreadID: "thread-a"}, "run-a"); got != "thread-a" {
+		t.Fatalf("runtimeWorkspaceKey with thread_id = %q, want thread-a", got)
+	}
+}
+
+func TestRuntimeWorkspaceLeaseForRunSkipsManagerWithoutThreadID(t *testing.T) {
+	service := &runtimePythonService{
+		cfg:        RuntimePythonConfig{LocalPython: defaultLocalPythonConfig()},
+		workspaces: NewRuntimeWorkspaceManager(t.TempDir()),
+	}
+
+	lease, err := service.workspaceLeaseForRun(PythonRunRequest{RunID: "run-a"}, "run-a")
+	if err != nil {
+		t.Fatalf("workspaceLeaseForRun without thread_id returned error: %v", err)
+	}
+	if lease.ImagePath != "" || lease.Key != "" {
+		t.Fatalf("workspaceLeaseForRun without thread_id = %#v, want empty lease", lease)
+	}
+	if got := service.workspaces.List(16).Workspaces; len(got) != 0 {
+		t.Fatalf("workspace manager list after run without thread_id = %#v, want empty", got)
+	}
+
+	lease, err = service.workspaceLeaseForRun(PythonRunRequest{RunID: "run-a", ThreadID: "thread-a"}, "run-a")
+	if err != nil {
+		t.Fatalf("workspaceLeaseForRun with thread_id returned error: %v", err)
+	}
+	defer lease.Release()
+	if lease.Key != "thread-a" || lease.ImagePath == "" {
+		t.Fatalf("workspaceLeaseForRun with thread_id = %#v, want managed lease", lease)
 	}
 }
 

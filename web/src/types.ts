@@ -49,3 +49,28 @@ export type RuntimeWorker = {
 export type RuntimeWorkerSetRequest = {
   count: number;
 };
+
+export type RuntimeStorageFile = {
+  path: string;
+  exists: boolean;
+  size_bytes?: number;
+  modified_at?: string;
+};
+
+export type RuntimeSnapshotStatus = {
+  worker_id: string;
+  busy: boolean;
+  snapshot_dir: string;
+  ok: boolean;
+  reason?: string;
+  version?: string;
+  files: Record<string, RuntimeStorageFile>;
+};
+
+export type RuntimeWorkspaceStatus = {
+  key: string;
+  busy: boolean;
+  workspace_mib: number;
+  expires_at?: string;
+  file: RuntimeStorageFile;
+};

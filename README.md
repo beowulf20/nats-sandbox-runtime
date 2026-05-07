@@ -121,6 +121,7 @@ nats req python.run '{
     {"object": "datasets/iot-device-timestamps.json", "path": "iot-device-timestamps.json"}
   ],
   "workspace_mib": 32,
+  "thread_id": "conversation-42",
   "memory_mib": 128,
   "exec_timeout": "10s"
 }'
@@ -131,7 +132,7 @@ The JSON response includes run metrics and uploaded artifact object keys. Stdout
 - `Nats-Service-Tests-Python-Stdout-B64`
 - `Nats-Service-Tests-Python-Stderr-B64`
 
-The corresponding `*-Truncated` headers indicate whether the metadata was capped by `--truncate-log-mib`. Artifacts are uploaded under `runs/<run_id>/artifacts/<workspace-path>` in the configured bucket.
+The corresponding `*-Truncated` headers indicate whether the metadata was capped by `--truncate-log-mib`. Artifacts are uploaded under `runs/<run_id>/artifacts/<workspace-path>` in the configured bucket. Runtime workspace ext4 images persist for one hour only when `thread_id` is supplied; runs without `thread_id` use an ephemeral workspace image that is removed after the run.
 
 Runtime execution is handled by a worker pool. At startup, `--workers` sets the initial desired worker count, and each worker owns an isolated snapshot directory under `<snapshot-dir>/workers/<worker-id>`. Requests are assigned to the first idle worker. The desired worker count can be changed while the service is running:
 
@@ -162,6 +163,8 @@ Open `http://127.0.0.1:8080` for the console. The lateral navigation includes:
 
 - `Overview`: NATS connection and runtime service status
 - `Workers`: current worker pool status and desired worker count
+- `Snapshots`: VM snapshot file status and per-worker reset
+- `Workspaces`: one-hour persistent workspace ext4 image status by thread ID
 - `Settings`: discoverable runtime defaults that affect future Python runs
 
 For local development with reloadable server and UI processes, run:
@@ -182,6 +185,10 @@ The local JSON endpoints are:
 - `GET /api/workers`
 - `GET /api/workers/events` for Server-Sent Events with live worker snapshots
 - `PUT /api/workers` with `{"count": <integer>}`
+- `GET /api/snapshots`
+- `DELETE /api/snapshots/workers/{worker_id}` to reset VM snapshot files for an idle worker
+- `GET /api/workspaces`
+- `DELETE /api/workspaces/{key}` to reset an idle thread workspace ext4 image
 - `GET /api/settings` for discoverable effective runtime settings
 - `GET /api/settings/{key}`
 - `PUT /api/settings/{key}` with `{"value": <json>}`

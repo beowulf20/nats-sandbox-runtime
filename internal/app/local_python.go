@@ -111,7 +111,7 @@ func RunLocalPython(ctx context.Context, cfg LocalPythonConfig, stdin io.Reader,
 	if err := checkKVMDevice("/dev/kvm"); err != nil {
 		return err
 	}
-	paths := localPythonSnapshotPaths(cfg.SnapshotDir)
+	paths := localPythonSnapshotPathsForConfig(cfg)
 	if err := ensureLocalPythonWorkspaceImage(ctx, cfg, paths); err != nil {
 		return err
 	}
@@ -150,7 +150,7 @@ func RunLocalPythonExec(ctx context.Context, cfg LocalPythonConfig) (LocalPython
 	if err := checkKVMDevice("/dev/kvm"); err != nil {
 		return LocalPythonExecResult{}, err
 	}
-	paths := localPythonSnapshotPaths(cfg.SnapshotDir)
+	paths := localPythonSnapshotPathsForConfig(cfg)
 	if err := ensureLocalPythonWorkspaceImage(ctx, cfg, paths); err != nil {
 		return LocalPythonExecResult{}, err
 	}
@@ -887,6 +887,14 @@ func localPythonSnapshotPaths(snapshotDir string) localPythonSnapshotFiles {
 		SwapPath:      filepath.Join(snapshotDir, "swap.raw"),
 		VersionPath:   filepath.Join(snapshotDir, "version"),
 	}
+}
+
+func localPythonSnapshotPathsForConfig(cfg LocalPythonConfig) localPythonSnapshotFiles {
+	paths := localPythonSnapshotPaths(cfg.SnapshotDir)
+	if cfg.WorkspaceImagePath != "" {
+		paths.WorkspacePath = cfg.WorkspaceImagePath
+	}
+	return paths
 }
 
 func localPythonSnapshotComplete(paths localPythonSnapshotFiles, cfg LocalPythonConfig) bool {

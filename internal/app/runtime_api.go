@@ -84,7 +84,7 @@ func RunRuntimeAPI(ctx context.Context, cfg RuntimeAPIConfig, out io.Writer) err
 	}
 	defer registration.Close()
 
-	handler := newRuntimeAPIHTTPHandler(controlPlane, registration.runtime.workerPool, runtimeAPIServiceOverviewProvider{
+	handler := newRuntimeAPIHTTPHandler(controlPlane, registration.runtime.workerPool, registration.runtime.workspaces, runtimeAPIServiceOverviewProvider{
 		cfg:          cfg,
 		conn:         registration.conn,
 		microService: registration.service,
@@ -207,7 +207,7 @@ func runtimeAPIEndpointStatuses(endpoints []micro.EndpointInfo) []RuntimeAPIEndp
 	return statuses
 }
 
-func newRuntimeAPIHTTPHandler(controlPlane *RuntimeControlPlane, workerPool *RuntimeWorkerPool, overviewProvider runtimeAPIOverviewProvider, webDir string) http.Handler {
+func newRuntimeAPIHTTPHandler(controlPlane *RuntimeControlPlane, workerPool *RuntimeWorkerPool, workspaces *RuntimeWorkspaceManager, overviewProvider runtimeAPIOverviewProvider, webDir string) http.Handler {
 	if controlPlane == nil {
 		controlPlane = NewRuntimeControlPlane(NewInMemorySettingsStore())
 	}
@@ -215,12 +215,17 @@ func newRuntimeAPIHTTPHandler(controlPlane *RuntimeControlPlane, workerPool *Run
 	api := &runtimeAPIHTTPServer{
 		controlPlane:     controlPlane,
 		workerPool:       workerPool,
+		workspaces:       workspaces,
 		overviewProvider: overviewProvider,
 		webDir:           webDir,
 	}
 	mux.HandleFunc("/api/overview", api.handleOverview)
 	mux.HandleFunc("/api/workers/events", api.handleWorkerEvents)
 	mux.HandleFunc("/api/workers", api.handleWorkers)
+	mux.HandleFunc("/api/snapshots", api.handleSnapshots)
+	mux.HandleFunc("/api/snapshots/workers/", api.handleSnapshot)
+	mux.HandleFunc("/api/workspaces", api.handleWorkspaces)
+	mux.HandleFunc("/api/workspaces/", api.handleWorkspace)
 	mux.HandleFunc("/api/settings", api.handleSettingsList)
 	mux.HandleFunc("/api/settings/", api.handleSetting)
 	mux.HandleFunc("/", api.handleStatic)
@@ -230,6 +235,7 @@ func newRuntimeAPIHTTPHandler(controlPlane *RuntimeControlPlane, workerPool *Run
 type runtimeAPIHTTPServer struct {
 	controlPlane     *RuntimeControlPlane
 	workerPool       *RuntimeWorkerPool
+	workspaces       *RuntimeWorkspaceManager
 	overviewProvider runtimeAPIOverviewProvider
 	webDir           string
 }
@@ -327,6 +333,82 @@ func (s *runtimeAPIHTTPServer) handleWorkerEvents(w http.ResponseWriter, r *http
 			flusher.Flush()
 		}
 	}
+}
+
+func (s *runtimeAPIHTTPServer) handleSnapshots(w http.ResponseWriter, r *http.Request) {
+	if s.workerPool == nil {
+		writeRuntimeAPIError(w, http.StatusServiceUnavailable, "worker pool is not configured")
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeRuntimeAPIJSON(w, http.StatusOK, runtimeSnapshotStatuses(s.workerPool))
+}
+
+func (s *runtimeAPIHTTPServer) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.workerPool == nil {
+		writeRuntimeAPIError(w, http.StatusServiceUnavailable, "worker pool is not configured")
+		return
+	}
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	workerID, err := runtimeStorageWorkerID(r.URL.Path, "/api/snapshots/workers/")
+	if err != nil {
+		writeRuntimeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := resetRuntimeSnapshot(s.workerPool, workerID); err != nil {
+		writeRuntimeAPIStorageError(w, err)
+		return
+	}
+	writeRuntimeAPIJSON(w, http.StatusOK, runtimeStorageStatusResponse{WorkerID: workerID, Status: "reset"})
+}
+
+func (s *runtimeAPIHTTPServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
+	if s.workspaces == nil {
+		writeRuntimeAPIError(w, http.StatusServiceUnavailable, "workspace manager is not configured")
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	workspaceMiB := int64(0)
+	if s.workerPool != nil {
+		cfg := s.workerPool.base.LocalPython
+		if s.controlPlane != nil {
+			if effective, err := s.controlPlane.ApplyToLocalPythonConfig(r.Context(), cfg); err == nil {
+				cfg = effective
+			}
+		}
+		workspaceMiB = cfg.WorkspaceMiB
+	}
+	writeRuntimeAPIJSON(w, http.StatusOK, s.workspaces.List(workspaceMiB))
+}
+
+func (s *runtimeAPIHTTPServer) handleWorkspace(w http.ResponseWriter, r *http.Request) {
+	if s.workspaces == nil {
+		writeRuntimeAPIError(w, http.StatusServiceUnavailable, "workspace manager is not configured")
+		return
+	}
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	key, err := runtimeStorageWorkspaceKey(r.URL.Path)
+	if err != nil {
+		writeRuntimeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.workspaces.Delete(key); err != nil {
+		writeRuntimeAPIStorageError(w, err)
+		return
+	}
+	writeRuntimeAPIJSON(w, http.StatusOK, runtimeStorageStatusResponse{Key: key, Status: "reset"})
 }
 
 func (s *runtimeAPIHTTPServer) handleSettingsList(w http.ResponseWriter, r *http.Request) {
@@ -432,6 +514,20 @@ func writeRuntimeAPIJSON(w http.ResponseWriter, status int, value any) {
 
 func writeRuntimeAPIError(w http.ResponseWriter, status int, message string) {
 	writeRuntimeAPIJSON(w, status, map[string]string{"error": message})
+}
+
+func writeRuntimeAPIStorageError(w http.ResponseWriter, err error) {
+	var notFound runtimeStorageNotFoundError
+	if errors.As(err, &notFound) {
+		writeRuntimeAPIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	var conflict runtimeStorageConflictError
+	if errors.As(err, &conflict) {
+		writeRuntimeAPIError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeRuntimeAPIError(w, http.StatusInternalServerError, err.Error())
 }
 
 func writeRuntimeAPISSE(w io.Writer, event string, value any) error {

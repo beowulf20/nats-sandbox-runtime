@@ -34,6 +34,7 @@ const (
 
 type PythonRunRequest struct {
 	RunID        string                   `json:"run_id,omitempty"`
+	ThreadID     string                   `json:"thread_id,omitempty"`
 	Code         string                   `json:"code,omitempty"`
 	CodeObject   string                   `json:"code_object,omitempty"`
 	Inputs       []PythonRunObjectMapping `json:"inputs,omitempty"`
@@ -76,6 +77,7 @@ type runtimePythonService struct {
 	store        jetstream.ObjectStore
 	controlPlane *RuntimeControlPlane
 	workerPool   *RuntimeWorkerPool
+	workspaces   *RuntimeWorkspaceManager
 }
 
 func RunRuntimePython(ctx context.Context, cfg RuntimePythonConfig, out io.Writer) error {
@@ -147,6 +149,7 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		store:        store,
 		controlPlane: controlPlane,
 		workerPool:   workerPool,
+		workspaces:   NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir),
 	}
 	srv, err := micro.AddService(nc, micro.Config{
 		Name:        runtimePythonServiceName,
@@ -231,6 +234,11 @@ func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq
 	if runID == "" {
 		runID = nats.NewInbox()[5:]
 	}
+	workspaceLease, err := s.workspaceLeaseForRun(runReq, runID)
+	if err != nil {
+		return PythonRunResponse{}, nil, nil, err
+	}
+	defer workspaceLease.Release()
 	workDir, err := os.MkdirTemp("", "nats-python-runtime-*")
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, fmt.Errorf("create runtime work dir: %w", err)
@@ -239,6 +247,19 @@ func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq
 	workspaceDir := filepath.Join(workDir, "workspace")
 	if err := os.MkdirAll(workspaceDir, 0o755); err != nil {
 		return PythonRunResponse{}, nil, nil, fmt.Errorf("create runtime workspace: %w", err)
+	}
+	workspaceImagePath := workspaceLease.ImagePath
+	if workspaceImagePath == "" {
+		workspaceImagePath = filepath.Join(workDir, "workspace.ext4")
+	}
+	if workspaceLease.ImagePath != "" {
+		if _, err := os.Stat(workspaceLease.ImagePath); err == nil {
+			if err := syncLocalPythonWorkspaceImage(ctx, LocalPythonConfig{WorkspaceDir: workspaceDir}, localPythonSnapshotFiles{WorkspacePath: workspaceLease.ImagePath}); err != nil {
+				return PythonRunResponse{}, nil, nil, fmt.Errorf("load workspace %q: %w", workspaceLease.Key, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return PythonRunResponse{}, nil, nil, fmt.Errorf("stat workspace %q: %w", workspaceLease.Key, err)
+		}
 	}
 	for _, input := range runReq.Inputs {
 		if err := fetchRuntimeObject(ctx, s.store, workspaceDir, input); err != nil {
@@ -257,7 +278,7 @@ func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq
 	}
 	startMarker := "__NATS_SERVICE_TESTS_RUNTIME_STDOUT_START_" + sanitizeRunIDForMarker(runID) + "__"
 	endMarker := "__NATS_SERVICE_TESTS_RUNTIME_STDOUT_END_" + sanitizeRunIDForMarker(runID) + "__"
-	cfg, err := s.localPythonConfigForRun(worker, runReq, workDir, workspaceDir, wrapRuntimePythonCode(code, startMarker, endMarker))
+	cfg, err := s.localPythonConfigForRun(worker, runReq, workDir, workspaceDir, workspaceImagePath, wrapRuntimePythonCode(code, startMarker, endMarker))
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, err
 	}
@@ -288,7 +309,26 @@ func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq
 	return response, stdout, result.Stderr, nil
 }
 
-func (s *runtimePythonService) localPythonConfigForRun(worker RuntimeWorker, runReq PythonRunRequest, workDir, workspaceDir, code string) (LocalPythonConfig, error) {
+func runtimeWorkspaceKey(runReq PythonRunRequest, runID string) string {
+	return strings.TrimSpace(runReq.ThreadID)
+}
+
+func (s *runtimePythonService) workspaceLeaseForRun(runReq PythonRunRequest, runID string) (RuntimeWorkspaceLease, error) {
+	key := runtimeWorkspaceKey(runReq, runID)
+	if key == "" {
+		return RuntimeWorkspaceLease{}, nil
+	}
+	return s.workspaceLease(key)
+}
+
+func (s *runtimePythonService) workspaceLease(key string) (RuntimeWorkspaceLease, error) {
+	if s.workspaces == nil {
+		s.workspaces = NewRuntimeWorkspaceManager(s.cfg.LocalPython.SnapshotDir)
+	}
+	return s.workspaces.Begin(key)
+}
+
+func (s *runtimePythonService) localPythonConfigForRun(worker RuntimeWorker, runReq PythonRunRequest, workDir, workspaceDir, workspaceImagePath, code string) (LocalPythonConfig, error) {
 	cfg := s.cfg.LocalPython
 	var err error
 	if s.controlPlane != nil {
@@ -300,6 +340,7 @@ func (s *runtimePythonService) localPythonConfigForRun(worker RuntimeWorker, run
 	cfg.InlineCommand = code
 	cfg.ExecFilePath = ""
 	cfg.WorkspaceDir = workspaceDir
+	cfg.WorkspaceImagePath = workspaceImagePath
 	if worker.SnapshotDir != "" {
 		cfg.SnapshotDir = worker.SnapshotDir
 	} else {

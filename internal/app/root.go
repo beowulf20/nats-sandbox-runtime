@@ -40,6 +40,7 @@ type LocalPythonConfig struct {
 	FirecrackerPath    string
 	SnapshotDir        string
 	WorkspaceDir       string
+	WorkspaceImagePath string
 	InlineCommand      string
 	ExecFilePath       string
 	HideFirecrackerLog bool
