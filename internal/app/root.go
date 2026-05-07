@@ -1,0 +1,262 @@
+package app
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+const LocalNATSURL = "nats://localhost:4222"
+
+const (
+	defaultLocalKernelPath = "firecracker-assets/vmlinux.bin"
+	defaultLocalRootfsPath = "firecracker-assets/rootfs.ext4"
+	defaultFirecrackerPath = "bin/firecracker"
+	defaultSnapshotDir     = "firecracker-assets/python-snapshot"
+	defaultWorkspaceDir    = "tmp/workspace"
+	defaultLocalMemoryMiB  = 128
+	defaultLocalVCPUs      = 1
+	defaultMaxVCPUs        = 1
+	defaultExecTimeout     = 5 * time.Second
+	defaultSwapMiB         = 0
+	defaultParallelRuns    = 1
+	defaultWorkspaceMiB    = 16
+	defaultRuntimeBucket   = "python-runtime-workspaces"
+	defaultMaxParallelRuns = 1
+)
+
+type Config struct {
+	Instances int
+	URL       string
+}
+
+type LocalPythonConfig struct {
+	KernelPath         string
+	RootfsPath         string
+	FirecrackerPath    string
+	SnapshotDir        string
+	WorkspaceDir       string
+	InlineCommand      string
+	ExecFilePath       string
+	HideFirecrackerLog bool
+	MemoryMiB          int64
+	SwapMiB            int64
+	WorkspaceMiB       int64
+	VCPUs              int64
+	MaxVCPUs           int64
+	Runs               int
+	ParallelRuns       int
+	ExecTimeout        time.Duration
+}
+
+type RuntimePythonConfig struct {
+	URL            string
+	Bucket         string
+	MaxParallel    int
+	LocalPython    LocalPythonConfig
+	StdoutHeader   string
+	StderrHeader   string
+	TruncateLogMiB int64
+}
+
+func NewRootCommand(run func(Config) error, runLocalPython func(context.Context, LocalPythonConfig) error, runRuntimePython ...func(context.Context, RuntimePythonConfig) error) *cobra.Command {
+	cfg := Config{
+		Instances: 1,
+		URL:       LocalNATSURL,
+	}
+	var runtimeRunner func(context.Context, RuntimePythonConfig) error
+	if len(runRuntimePython) > 0 {
+		runtimeRunner = runRuntimePython[0]
+	}
+
+	cmd := &cobra.Command{
+		Use:           "nats-service-tests",
+		Short:         "Register multiple NATS service instances that return timestamps",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cfg.Instances < 1 {
+				return fmt.Errorf("instances must be at least 1")
+			}
+			if run == nil {
+				return fmt.Errorf("service runner is not configured")
+			}
+			return run(cfg)
+		},
+	}
+
+	cmd.Flags().IntVarP(&cfg.Instances, "instances", "i", cfg.Instances, "number of service instances to register")
+	cmd.AddCommand(newLocalCommand(runLocalPython))
+	cmd.AddCommand(newRuntimeCommand(runtimeRunner))
+
+	return cmd
+}
+
+func newLocalCommand(runLocalPython func(context.Context, LocalPythonConfig) error) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "local",
+		Short: "Run local development helpers",
+	}
+	cmd.AddCommand(newLocalPythonCommand(runLocalPython))
+	return cmd
+}
+
+func newLocalPythonCommand(runLocalPython func(context.Context, LocalPythonConfig) error) *cobra.Command {
+	cfg := defaultLocalPythonConfig()
+
+	cmd := &cobra.Command{
+		Use:   "python",
+		Short: "Start a Firecracker microVM running Python on the serial console",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateLocalPythonConfig(cfg); err != nil {
+				return err
+			}
+			if cfg.InlineCommand != "" && cfg.ExecFilePath != "" {
+				return fmt.Errorf("--exec and --exec-file are mutually exclusive")
+			}
+			if cfg.Runs > 1 && cfg.InlineCommand == "" && cfg.ExecFilePath == "" {
+				return fmt.Errorf("runs requires --exec or --exec-file")
+			}
+			if runLocalPython == nil {
+				return fmt.Errorf("local python runner is not configured")
+			}
+			return runLocalPython(cmd.Context(), cfg)
+		},
+	}
+
+	addLocalPythonFlags(cmd, &cfg)
+	return cmd
+}
+
+func defaultLocalPythonConfig() LocalPythonConfig {
+	return LocalPythonConfig{
+		KernelPath:      defaultLocalKernelPath,
+		RootfsPath:      defaultLocalRootfsPath,
+		FirecrackerPath: defaultFirecrackerPath,
+		SnapshotDir:     defaultSnapshotDir,
+		WorkspaceDir:    defaultWorkspaceDir,
+		MemoryMiB:       defaultLocalMemoryMiB,
+		SwapMiB:         defaultSwapMiB,
+		WorkspaceMiB:    defaultWorkspaceMiB,
+		VCPUs:           defaultLocalVCPUs,
+		MaxVCPUs:        defaultMaxVCPUs,
+		Runs:            1,
+		ParallelRuns:    defaultParallelRuns,
+		ExecTimeout:     defaultExecTimeout,
+	}
+}
+
+func validateLocalPythonConfig(cfg LocalPythonConfig) error {
+	if cfg.MemoryMiB < 1 {
+		return fmt.Errorf("memory-mib must be at least 1")
+	}
+	if cfg.SwapMiB < 0 {
+		return fmt.Errorf("swap-mib must be at least 0")
+	}
+	if cfg.WorkspaceMiB < 1 {
+		return fmt.Errorf("workspace-mib must be at least 1")
+	}
+	if cfg.VCPUs < 1 {
+		return fmt.Errorf("vcpus must be at least 1")
+	}
+	if cfg.MaxVCPUs < 1 {
+		return fmt.Errorf("max-vcpus must be at least 1")
+	}
+	if cfg.VCPUs > cfg.MaxVCPUs {
+		return fmt.Errorf("vcpus must be less than or equal to max-vcpus (%d)", cfg.MaxVCPUs)
+	}
+	if cfg.Runs < 1 {
+		return fmt.Errorf("runs must be at least 1")
+	}
+	if cfg.ParallelRuns < 1 {
+		return fmt.Errorf("parallel-runs must be at least 1")
+	}
+	if cfg.ExecTimeout <= 0 {
+		return fmt.Errorf("exec-timeout must be greater than 0")
+	}
+	return nil
+}
+
+func addLocalPythonFlags(cmd *cobra.Command, cfg *LocalPythonConfig) {
+	cmd.Flags().StringVar(&cfg.KernelPath, "kernel", cfg.KernelPath, "Firecracker guest kernel path")
+	cmd.Flags().StringVar(&cfg.RootfsPath, "rootfs", cfg.RootfsPath, "Firecracker rootfs path")
+	cmd.Flags().StringVar(&cfg.FirecrackerPath, "firecracker", cfg.FirecrackerPath, "Firecracker binary path")
+	cmd.Flags().StringVar(&cfg.SnapshotDir, "snapshot-dir", cfg.SnapshotDir, "Firecracker Python snapshot cache directory")
+	cmd.Flags().StringVar(&cfg.WorkspaceDir, "workspace-dir", cfg.WorkspaceDir, "directory copied into the VM at /workspace")
+	cmd.Flags().StringVarP(&cfg.InlineCommand, "exec", "e", cfg.InlineCommand, "inline Python command to run instead of starting a REPL")
+	cmd.Flags().StringVar(&cfg.ExecFilePath, "exec-file", cfg.ExecFilePath, "Python script file to run instead of starting a REPL")
+	cmd.Flags().BoolVar(&cfg.HideFirecrackerLog, "hide-firecracker-log", cfg.HideFirecrackerLog, "hide Firecracker process logs")
+	cmd.Flags().Int64Var(&cfg.MemoryMiB, "memory-mib", cfg.MemoryMiB, "microVM memory size in MiB")
+	cmd.Flags().Int64Var(&cfg.SwapMiB, "swap-mib", cfg.SwapMiB, "dedicated guest swap image size in MiB")
+	cmd.Flags().Int64Var(&cfg.WorkspaceMiB, "workspace-mib", cfg.WorkspaceMiB, "workspace filesystem size in MiB")
+	cmd.Flags().Int64Var(&cfg.VCPUs, "vcpus", cfg.VCPUs, "microVM vCPU count")
+	cmd.Flags().Int64Var(&cfg.MaxVCPUs, "max-vcpus", cfg.MaxVCPUs, "maximum allowed microVM vCPU count")
+	cmd.Flags().IntVar(&cfg.Runs, "runs", 1, "number of snapshot restore exec runs to benchmark")
+	cmd.Flags().IntVar(&cfg.ParallelRuns, "parallel-runs", cfg.ParallelRuns, "maximum number of benchmark runs to execute in parallel")
+	cmd.Flags().DurationVar(&cfg.ExecTimeout, "exec-timeout", cfg.ExecTimeout, "maximum time to wait for Python exec completion in benchmark runs")
+}
+
+func newRuntimeCommand(runRuntimePython func(context.Context, RuntimePythonConfig) error) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "runtime",
+		Short: "Run NATS-backed runtimes",
+	}
+	cmd.AddCommand(newRuntimePythonCommand(runRuntimePython))
+	return cmd
+}
+
+func newRuntimePythonCommand(runRuntimePython func(context.Context, RuntimePythonConfig) error) *cobra.Command {
+	localCfg := defaultLocalPythonConfig()
+	localCfg.HideFirecrackerLog = true
+	runtimeCfg := RuntimePythonConfig{
+		URL:            LocalNATSURL,
+		Bucket:         defaultRuntimeBucket,
+		MaxParallel:    defaultMaxParallelRuns,
+		LocalPython:    localCfg,
+		StdoutHeader:   "Nats-Service-Tests-Python-Stdout-B64",
+		StderrHeader:   "Nats-Service-Tests-Python-Stderr-B64",
+		TruncateLogMiB: 1,
+	}
+
+	cmd := &cobra.Command{
+		Use:   "python",
+		Short: "Run a NATS service that executes Python in Firecracker",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateLocalPythonConfig(runtimeCfg.LocalPython); err != nil {
+				return err
+			}
+			if runtimeCfg.MaxParallel < 1 {
+				return fmt.Errorf("max-parallel must be at least 1")
+			}
+			if runtimeCfg.Bucket == "" {
+				return fmt.Errorf("bucket must not be empty")
+			}
+			if runtimeCfg.TruncateLogMiB < 0 {
+				return fmt.Errorf("truncate-log-mib must be at least 0")
+			}
+			if runRuntimePython == nil {
+				return fmt.Errorf("runtime python runner is not configured")
+			}
+			return runRuntimePython(cmd.Context(), runtimeCfg)
+		},
+	}
+	cmd.Flags().StringVar(&runtimeCfg.LocalPython.KernelPath, "kernel", runtimeCfg.LocalPython.KernelPath, "Firecracker guest kernel path")
+	cmd.Flags().StringVar(&runtimeCfg.LocalPython.RootfsPath, "rootfs", runtimeCfg.LocalPython.RootfsPath, "Firecracker rootfs path")
+	cmd.Flags().StringVar(&runtimeCfg.LocalPython.FirecrackerPath, "firecracker", runtimeCfg.LocalPython.FirecrackerPath, "Firecracker binary path")
+	cmd.Flags().BoolVar(&runtimeCfg.LocalPython.HideFirecrackerLog, "hide-firecracker-log", runtimeCfg.LocalPython.HideFirecrackerLog, "hide Firecracker process logs")
+	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.MemoryMiB, "memory-mib", runtimeCfg.LocalPython.MemoryMiB, "default microVM memory size in MiB")
+	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.SwapMiB, "swap-mib", runtimeCfg.LocalPython.SwapMiB, "default dedicated guest swap image size in MiB")
+	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.WorkspaceMiB, "workspace-mib", runtimeCfg.LocalPython.WorkspaceMiB, "default workspace filesystem size in MiB")
+	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.VCPUs, "vcpus", runtimeCfg.LocalPython.VCPUs, "microVM vCPU count")
+	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.MaxVCPUs, "max-vcpus", runtimeCfg.LocalPython.MaxVCPUs, "maximum allowed microVM vCPU count")
+	cmd.Flags().DurationVar(&runtimeCfg.LocalPython.ExecTimeout, "exec-timeout", runtimeCfg.LocalPython.ExecTimeout, "default maximum time to wait for Python exec completion")
+	cmd.Flags().StringVar(&runtimeCfg.URL, "url", runtimeCfg.URL, "NATS server URL")
+	cmd.Flags().StringVar(&runtimeCfg.Bucket, "bucket", runtimeCfg.Bucket, "NATS Object Store bucket for runtime workspaces")
+	cmd.Flags().IntVar(&runtimeCfg.MaxParallel, "max-parallel", runtimeCfg.MaxParallel, "maximum Python runs to execute concurrently")
+	cmd.Flags().StringVar(&runtimeCfg.StdoutHeader, "stdout-header", runtimeCfg.StdoutHeader, "response header used for base64 stdout metadata")
+	cmd.Flags().StringVar(&runtimeCfg.StderrHeader, "stderr-header", runtimeCfg.StderrHeader, "response header used for base64 stderr metadata")
+	cmd.Flags().Int64Var(&runtimeCfg.TruncateLogMiB, "truncate-log-mib", runtimeCfg.TruncateLogMiB, "maximum stdout/stderr MiB returned in response metadata; 0 disables truncation")
+	return cmd
+}

@@ -1,0 +1,125 @@
+package app
+
+import (
+	"encoding/base64"
+	"testing"
+	"time"
+)
+
+func TestRuntimePythonLocalConfigForRunAppliesRequestOverrides(t *testing.T) {
+	service := &runtimePythonService{
+		cfg: RuntimePythonConfig{
+			LocalPython: defaultLocalPythonConfig(),
+		},
+	}
+
+	got, err := service.localPythonConfigForRun(PythonRunRequest{
+		MemoryMiB:    256,
+		SwapMiB:      64,
+		WorkspaceMiB: 32,
+		ExecTimeout:  "12s",
+	}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	if err != nil {
+		t.Fatalf("localPythonConfigForRun returned error: %v", err)
+	}
+
+	if got.InlineCommand != "print(42)" {
+		t.Fatalf("InlineCommand = %q, want code", got.InlineCommand)
+	}
+	if got.WorkspaceDir != "/tmp/run/workspace" {
+		t.Fatalf("WorkspaceDir = %q, want run workspace", got.WorkspaceDir)
+	}
+	if got.SnapshotDir != "/tmp/run/snapshot" {
+		t.Fatalf("SnapshotDir = %q, want per-run snapshot", got.SnapshotDir)
+	}
+	if got.MemoryMiB != 256 || got.SwapMiB != 64 || got.WorkspaceMiB != 32 {
+		t.Fatalf("resources = memory:%d swap:%d workspace:%d, want request overrides", got.MemoryMiB, got.SwapMiB, got.WorkspaceMiB)
+	}
+	if got.ExecTimeout != 12*time.Second {
+		t.Fatalf("ExecTimeout = %s, want 12s", got.ExecTimeout)
+	}
+	if !got.HideFirecrackerLog {
+		t.Fatal("HideFirecrackerLog = false, want runtime runs to hide firecracker logs")
+	}
+}
+
+func TestRuntimePythonLocalConfigForRunRejectsInvalidTimeout(t *testing.T) {
+	service := &runtimePythonService{cfg: RuntimePythonConfig{LocalPython: defaultLocalPythonConfig()}}
+
+	_, err := service.localPythonConfigForRun(PythonRunRequest{ExecTimeout: "bogus"}, "/tmp/run", "/tmp/run/workspace", "print(42)")
+	if err == nil {
+		t.Fatal("localPythonConfigForRun returned nil, want invalid timeout error")
+	}
+}
+
+func TestCleanWorkspaceRelativePathRejectsEscapes(t *testing.T) {
+	for _, path := range []string{"", "../secret", "/abs/path", "."} {
+		if _, err := cleanWorkspaceRelativePath(path); err == nil {
+			t.Fatalf("cleanWorkspaceRelativePath(%q) returned nil, want error", path)
+		}
+	}
+
+	got, err := cleanWorkspaceRelativePath("data/input.json")
+	if err != nil {
+		t.Fatalf("cleanWorkspaceRelativePath returned error: %v", err)
+	}
+	if got != "data/input.json" {
+		t.Fatalf("clean path = %q, want data/input.json", got)
+	}
+}
+
+func TestRuntimePythonLogHeadersBase64EncodeAndMarkTruncation(t *testing.T) {
+	service := &runtimePythonService{cfg: RuntimePythonConfig{
+		StdoutHeader:   "X-Stdout",
+		StderrHeader:   "X-Stderr",
+		TruncateLogMiB: 1,
+	}}
+
+	headers := service.logHeaders([]byte("hello"), []byte("oops"))
+	stdout, err := base64.StdEncoding.DecodeString(headers.Get("X-Stdout"))
+	if err != nil {
+		t.Fatalf("Decode stdout returned error: %v", err)
+	}
+	if string(stdout) != "hello" {
+		t.Fatalf("stdout header = %q, want hello", stdout)
+	}
+	stderr, err := base64.StdEncoding.DecodeString(headers.Get("X-Stderr"))
+	if err != nil {
+		t.Fatalf("Decode stderr returned error: %v", err)
+	}
+	if string(stderr) != "oops" {
+		t.Fatalf("stderr header = %q, want oops", stderr)
+	}
+	if headers.Get("X-Stdout-Truncated") != "false" || headers.Get("X-Stderr-Truncated") != "false" {
+		t.Fatalf("truncation headers = %q/%q, want false/false", headers.Get("X-Stdout-Truncated"), headers.Get("X-Stderr-Truncated"))
+	}
+}
+
+func TestTruncateForMetadata(t *testing.T) {
+	data := make([]byte, 2*1024*1024)
+
+	got, truncated := truncateForMetadata(data, 1)
+	if !truncated {
+		t.Fatal("truncated = false, want true")
+	}
+	if len(got) != 1024*1024 {
+		t.Fatalf("truncated len = %d, want 1 MiB", len(got))
+	}
+}
+
+func TestExtractRuntimePythonStdoutUsesServiceMarkers(t *testing.T) {
+	output := []byte("repl echo\n__START__\nhello\nworld\n__END__\nvm runtime_ms=1\n")
+
+	got := extractRuntimePythonStdout(output, "__START__", "__END__")
+	if string(got) != "hello\nworld" {
+		t.Fatalf("stdout = %q, want user output only", got)
+	}
+}
+
+func TestWrapRuntimePythonCodeAddsMarkers(t *testing.T) {
+	got := wrapRuntimePythonCode("print(42)", "START", "END")
+
+	if !containsAll(got, `print("START")`, "print(42)", `print("END")`) {
+		t.Fatalf("wrapped code = %q, want start marker, code, end marker", got)
+	}
+}
