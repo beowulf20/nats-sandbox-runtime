@@ -23,17 +23,20 @@ Python on Firecracker is the first supported runtime. The service shape is inten
 
 ## Docker Image
 
-The Dockerfile builds three things into one runtime image:
+The Dockerfile builds four things into one runtime image:
 
 - the Go service binary;
 - the built `web/` console;
-- the Firecracker binary plus the checked-in kernel/rootfs assets needed by the Python guest.
+- the Firecracker binary;
+- the Firecracker guest kernel/rootfs assets needed by the Python guest.
 
 Build it:
 
 ```bash
 docker build -t nats-sandbox-runtime:local .
 ```
+
+The build downloads the Firecracker release binary and Firecracker CI guest assets, then patches the guest rootfs with this repo's Python init script. It does not require a local `firecracker-assets/` directory.
 
 The image defaults to `runtime api`, listens on `0.0.0.0:8080`, and expects a NATS server named `nats` with JetStream enabled.
 
