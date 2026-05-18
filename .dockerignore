@@ -1,0 +1,12 @@
+.git
+.gitignore
+.air.toml
+bin
+tmp
+web/build
+web/node_modules
+
+firecracker-assets/**
+!firecracker-assets/
+!firecracker-assets/vmlinux-6.1.155
+!firecracker-assets/ubuntu-24.04-python-data.ext4
