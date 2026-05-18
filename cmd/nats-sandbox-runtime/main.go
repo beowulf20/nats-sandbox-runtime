@@ -6,7 +6,7 @@ import (
 	"os"
 	"os/signal"
 
-	"nats-service-tests/internal/app"
+	"nats-sandbox-runtime/internal/app"
 )
 
 func main() {

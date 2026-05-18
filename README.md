@@ -1,6 +1,6 @@
-# NATS Python Sandbox Runtime
+# NATS Sandbox Runtime
 
-This repo packages a NATS microservice that runs Python code inside a Firecracker microVM. It is meant for agent and automation workloads that need a disposable Python sandbox, a stable NATS request interface, and workspace artifacts stored outside the VM in JetStream Object Store.
+This repo packages a NATS microservice that runs Python code inside a Firecracker microVM. It is meant for agent and automation workloads that need a disposable sandbox, a stable NATS request interface, and workspace artifacts stored outside the VM in JetStream Object Store.
 
 The main deployment target is:
 
@@ -9,6 +9,8 @@ NATS request -> python.run -> worker pool -> Firecracker Python VM -> JetStream 
 ```
 
 The runtime can also serve the local Horizon web console on the same process with `runtime api`.
+
+Python on Firecracker is the first supported runtime. The service shape is intentionally runtime-oriented rather than Python-only: the NATS request/control plane, worker pool, workspace artifact flow, and web console can be adapted for other sandbox runtimes later as new execution backends are needed.
 
 ## What It Provides
 
@@ -30,7 +32,7 @@ The Dockerfile builds three things into one runtime image:
 Build it:
 
 ```bash
-docker build -t nats-python-runtime:local .
+docker build -t nats-sandbox-runtime:local .
 ```
 
 The image defaults to `runtime api`, listens on `0.0.0.0:8080`, and expects a NATS server named `nats` with JetStream enabled.
@@ -42,7 +44,7 @@ docker run --rm \
   -p 8080:8080 \
   -e NATS_URL=nats://host.docker.internal:4222 \
   -e NATS_BUCKET=python-runtime-workspaces \
-  nats-python-runtime:local
+  nats-sandbox-runtime:local
 ```
 
 Firecracker needs host KVM access. `--privileged` is the broad, simple development option. For production, replace it with a tighter runtime policy that still exposes `/dev/kvm` and permits Firecracker KVM ioctls.
@@ -55,13 +57,13 @@ docker run --rm \
   --privileged \
   -e NATS_RUNTIME_MODE=python \
   -e NATS_URL=nats://host.docker.internal:4222 \
-  nats-python-runtime:local
+  nats-sandbox-runtime:local
 ```
 
 You can also bypass the entrypoint defaults and pass the CLI directly:
 
 ```bash
-docker run --rm --device=/dev/kvm --privileged nats-python-runtime:local \
+docker run --rm --device=/dev/kvm --privileged nats-sandbox-runtime:local \
   runtime python \
   --url nats://host.docker.internal:4222 \
   --bucket python-runtime-workspaces \
@@ -76,7 +78,7 @@ The container entrypoint maps environment variables to CLI flags. Extra argument
 | --- | --- | --- | --- |
 | `NATS_RUNTIME_MODE` | `api` | `runtime api` / `runtime python` | Starts the HTTP console plus runtime, or only the NATS runtime. |
 | `RUNTIME_API_LISTEN` | `0.0.0.0:8080` | `--listen` | HTTP listen address for `runtime api`. |
-| `RUNTIME_API_WEB_DIR` | `/opt/nats-python-runtime/web/build` | `--web-dir` | Built frontend directory served by `runtime api`. |
+| `RUNTIME_API_WEB_DIR` | `/opt/nats-sandbox-runtime/web/build` | `--web-dir` | Built frontend directory served by `runtime api`. |
 | `NATS_URL` | `nats://nats:4222` | `--url` | NATS server URL. JetStream must be enabled. |
 | `NATS_BUCKET` | `python-runtime-workspaces` | `--bucket` | Object Store bucket for input files and run artifacts. |
 | `NATS_RUNTIME_WORKERS` | `1` | `--workers` | Initial worker count. Each worker can run one request at a time. |
@@ -165,8 +167,8 @@ The JSON response includes the run ID, status, VM restore-to-exec latency, resou
     }
   ],
   "worker_id": "worker-1",
-  "stdout_header": "Nats-Service-Tests-Python-Stdout-B64",
-  "stderr_header": "Nats-Service-Tests-Python-Stderr-B64",
+  "stdout_header": "Nats-Sandbox-Runtime-Python-Stdout-B64",
+  "stderr_header": "Nats-Sandbox-Runtime-Python-Stderr-B64",
   "stdout_truncated": false,
   "stderr_truncated": false
 }
@@ -174,8 +176,8 @@ The JSON response includes the run ID, status, VM restore-to-exec latency, resou
 
 Stdout and stderr are returned as base64 NATS headers:
 
-- `Nats-Service-Tests-Python-Stdout-B64`
-- `Nats-Service-Tests-Python-Stderr-B64`
+- `Nats-Sandbox-Runtime-Python-Stdout-B64`
+- `Nats-Sandbox-Runtime-Python-Stderr-B64`
 
 ## Go SDK V0
 
@@ -189,7 +191,7 @@ import (
 	"fmt"
 	"log"
 
-	"nats-service-tests/pkg/pyruntime"
+	"nats-sandbox-runtime/pkg/pyruntime"
 )
 
 func main() {
@@ -284,7 +286,7 @@ make build
 Run the runtime API directly:
 
 ```bash
-tmp/go/bin/go run ./cmd/nats-service-tests runtime api --bucket python-runtime-workspaces
+tmp/go/bin/go run ./cmd/nats-sandbox-runtime runtime api --bucket python-runtime-workspaces
 ```
 
 Build the frontend first when serving the console without Docker:
@@ -308,7 +310,7 @@ The dev target runs the Go runtime API on `127.0.0.1:8080` and the React dev ser
 For one-off local VM checks without NATS:
 
 ```bash
-tmp/go/bin/go run ./cmd/nats-service-tests local python --exec 'print("hello from vm")'
+tmp/go/bin/go run ./cmd/nats-sandbox-runtime local python --exec 'print("hello from vm")'
 ```
 
 Useful flags include:
@@ -327,7 +329,7 @@ Useful flags include:
 The root command still contains the original NATS service registration test:
 
 ```bash
-tmp/go/bin/go run ./cmd/nats-service-tests --instances 3
+tmp/go/bin/go run ./cmd/nats-sandbox-runtime --instances 3
 nats req time.now ''
 ```
 

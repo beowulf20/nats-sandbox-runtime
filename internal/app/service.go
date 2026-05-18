@@ -6,7 +6,7 @@ import (
 	"io"
 	"time"
 
-	"nats-service-tests/internal/timestamp"
+	"nats-sandbox-runtime/internal/timestamp"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"

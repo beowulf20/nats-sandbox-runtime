@@ -8,7 +8,7 @@ RUNTIME_API_BUCKET ?= python-runtime-workspaces
 .PHONY: build firecracker dev
 
 build:
-	$(GO) build -buildvcs=false -o bin/nats-service-tests ./cmd/nats-service-tests
+	$(GO) build -buildvcs=false -o bin/nats-sandbox-runtime ./cmd/nats-sandbox-runtime
 
 dev:
 	@command -v $(NPM) >/dev/null 2>&1 || { echo "npm is required for the web dev server"; exit 1; }

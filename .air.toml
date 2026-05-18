@@ -2,7 +2,7 @@ root = "."
 tmp_dir = "tmp/air"
 
 [build]
-cmd = "tmp/go/bin/go build -buildvcs=false -o ./tmp/air/nats-service-tests ./cmd/nats-service-tests"
+cmd = "tmp/go/bin/go build -buildvcs=false -o ./tmp/air/nats-sandbox-runtime ./cmd/nats-sandbox-runtime"
 entrypoint = ["sh", "./scripts/run-runtime-api-dev.sh"]
 delay = 1000
 exclude_dir = ["firecracker-assets", "node_modules", "tmp", "web/build", "web/node_modules"]

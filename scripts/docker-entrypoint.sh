@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
 set -eu
 
-binary="/usr/local/bin/nats-service-tests"
+binary="/usr/local/bin/nats-sandbox-runtime"
 mode="${NATS_RUNTIME_MODE:-api}"
 
 case "${1:-}" in
-	nats-service-tests)
+	nats-sandbox-runtime)
 		shift
 		exec "${binary}" "$@"
 		;;
@@ -22,8 +22,8 @@ common_args="
 	--url ${NATS_URL:-nats://nats:4222}
 	--bucket ${NATS_BUCKET:-python-runtime-workspaces}
 	--workers ${NATS_RUNTIME_WORKERS:-1}
-	--kernel ${NATS_RUNTIME_KERNEL:-/opt/nats-python-runtime/firecracker-assets/vmlinux.bin}
-	--rootfs ${NATS_RUNTIME_ROOTFS:-/opt/nats-python-runtime/firecracker-assets/rootfs.ext4}
+	--kernel ${NATS_RUNTIME_KERNEL:-/opt/nats-sandbox-runtime/firecracker-assets/vmlinux.bin}
+	--rootfs ${NATS_RUNTIME_ROOTFS:-/opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4}
 	--firecracker ${NATS_RUNTIME_FIRECRACKER:-/usr/local/bin/firecracker}
 	--memory-mib ${NATS_RUNTIME_MEMORY_MIB:-128}
 	--swap-mib ${NATS_RUNTIME_SWAP_MIB:-0}
@@ -38,7 +38,7 @@ if [ "${mode}" = "api" ]; then
 	# shellcheck disable=SC2086
 	exec "${binary}" runtime api \
 		--listen "${RUNTIME_API_LISTEN:-0.0.0.0:8080}" \
-		--web-dir "${RUNTIME_API_WEB_DIR:-/opt/nats-python-runtime/web/build}" \
+		--web-dir "${RUNTIME_API_WEB_DIR:-/opt/nats-sandbox-runtime/web/build}" \
 		${common_args} \
 		"$@"
 fi

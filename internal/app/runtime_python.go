@@ -239,7 +239,7 @@ func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq
 		return PythonRunResponse{}, nil, nil, err
 	}
 	defer workspaceLease.Release()
-	workDir, err := os.MkdirTemp("", "nats-python-runtime-*")
+	workDir, err := os.MkdirTemp("", "nats-sandbox-runtime-*")
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, fmt.Errorf("create runtime work dir: %w", err)
 	}
@@ -276,8 +276,8 @@ func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq
 	if code == "" {
 		return PythonRunResponse{}, nil, nil, fmt.Errorf("request requires code or code_object")
 	}
-	startMarker := "__NATS_SERVICE_TESTS_RUNTIME_STDOUT_START_" + sanitizeRunIDForMarker(runID) + "__"
-	endMarker := "__NATS_SERVICE_TESTS_RUNTIME_STDOUT_END_" + sanitizeRunIDForMarker(runID) + "__"
+	startMarker := "__NATS_SANDBOX_RUNTIME_STDOUT_START_" + sanitizeRunIDForMarker(runID) + "__"
+	endMarker := "__NATS_SANDBOX_RUNTIME_STDOUT_END_" + sanitizeRunIDForMarker(runID) + "__"
 	cfg, err := s.localPythonConfigForRun(worker, runReq, workDir, workspaceDir, workspaceImagePath, wrapRuntimePythonCode(code, startMarker, endMarker))
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, err

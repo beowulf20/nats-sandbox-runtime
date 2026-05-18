@@ -1,4 +1,4 @@
-module nats-service-tests
+module nats-sandbox-runtime
 
 go 1.26.2
 

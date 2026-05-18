@@ -17,7 +17,7 @@ RUN go mod download
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 ARG TARGETARCH=amd64
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -buildvcs=false -o /out/nats-service-tests ./cmd/nats-service-tests
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -buildvcs=false -o /out/nats-sandbox-runtime ./cmd/nats-sandbox-runtime
 
 FROM debian:bookworm-slim AS runtime
 ARG TARGETARCH=amd64
@@ -43,9 +43,9 @@ RUN set -eu; \
 	install -m 0755 "${tmpdir}/release-${version}-${fc_arch}/firecracker-${version}-${fc_arch}" /usr/local/bin/firecracker; \
 	rm -rf "${tmpdir}"
 
-WORKDIR /opt/nats-python-runtime
+WORKDIR /opt/nats-sandbox-runtime
 RUN mkdir -p firecracker-assets/python-snapshot web
-COPY --from=go-build /out/nats-service-tests /usr/local/bin/nats-service-tests
+COPY --from=go-build /out/nats-sandbox-runtime /usr/local/bin/nats-sandbox-runtime
 COPY --from=web-build /src/web/build ./web/build
 COPY firecracker-assets/vmlinux-6.1.155 ./firecracker-assets/vmlinux-6.1.155
 COPY firecracker-assets/ubuntu-24.04-python-data.ext4 ./firecracker-assets/ubuntu-24.04-python-data.ext4

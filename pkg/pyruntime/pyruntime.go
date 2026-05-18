@@ -24,8 +24,8 @@ const (
 	defaultMaxOutputTotalBytes int64 = 32 * 1024 * 1024
 
 	runSubject   = "python.run"
-	stdoutHeader = "Nats-Service-Tests-Python-Stdout-B64"
-	stderrHeader = "Nats-Service-Tests-Python-Stderr-B64"
+	stdoutHeader = "Nats-Sandbox-Runtime-Python-Stdout-B64"
+	stderrHeader = "Nats-Sandbox-Runtime-Python-Stderr-B64"
 )
 
 // Config controls the SDK connection, Object Store bucket, and byte safeguards.

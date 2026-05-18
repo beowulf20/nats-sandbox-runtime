@@ -33,7 +33,7 @@ export default function Shell() {
         <div className="flex items-center justify-between px-8 pt-8">
           <div>
             <p className="font-poppins text-[24px] font-bold uppercase tracking-normal text-navy-700">
-              NATS <span className="font-medium">Runtime</span>
+              NATS <span className="font-medium">Sandbox</span>
             </p>
             <p className="mt-1 text-sm font-medium text-gray-600">Local console</p>
           </div>

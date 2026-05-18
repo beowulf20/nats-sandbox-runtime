@@ -85,8 +85,8 @@ func NewRootCommandWithRuntimeAPI(run func(Config) error, runLocalPython func(co
 	}
 
 	cmd := &cobra.Command{
-		Use:           "nats-service-tests",
-		Short:         "Register multiple NATS service instances that return timestamps",
+		Use:           "nats-sandbox-runtime",
+		Short:         "Run NATS sandbox runtime services and local helpers",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -281,8 +281,8 @@ func defaultRuntimePythonConfig() RuntimePythonConfig {
 		Bucket:         defaultRuntimeBucket,
 		MaxParallel:    defaultMaxParallelRuns,
 		LocalPython:    localCfg,
-		StdoutHeader:   "Nats-Service-Tests-Python-Stdout-B64",
-		StderrHeader:   "Nats-Service-Tests-Python-Stderr-B64",
+		StdoutHeader:   "Nats-Sandbox-Runtime-Python-Stdout-B64",
+		StderrHeader:   "Nats-Sandbox-Runtime-Python-Stderr-B64",
 		TruncateLogMiB: 1,
 	}
 }

@@ -192,7 +192,7 @@ func ensureLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths
 		fmt.Fprintf(stderr, "creating python snapshot: %s\n", filepath.Dir(paths.StatePath))
 	}
 
-	workDir, err := os.MkdirTemp("", "nats-service-tests-firecracker-*")
+	workDir, err := os.MkdirTemp("", "nats-sandbox-runtime-firecracker-*")
 	if err != nil {
 		return fmt.Errorf("create firecracker work dir: %w", err)
 	}
@@ -251,7 +251,7 @@ func ensureLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths
 		_ = cmd.Wait()
 		return fmt.Errorf("prepare snapshot guest: %w", err)
 	}
-	if err := waitForBuffer(ctx, &output, "__NATS_SERVICE_TESTS_SNAPSHOT_READY__", 10*time.Second); err != nil {
+	if err := waitForBuffer(ctx, &output, "__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__", 10*time.Second); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return fmt.Errorf("wait for snapshot guest readiness: %w", err)
@@ -360,7 +360,7 @@ func runLocalPythonSnapshotOnce(ctx context.Context, cfg LocalPythonConfig, path
 	if err != nil {
 		return 0, err
 	}
-	workDir, err := os.MkdirTemp("", "nats-service-tests-firecracker-*")
+	workDir, err := os.MkdirTemp("", "nats-sandbox-runtime-firecracker-*")
 	if err != nil {
 		return 0, fmt.Errorf("create firecracker work dir: %w", err)
 	}
@@ -570,13 +570,13 @@ func runLocalPythonBenchmarkOnce(ctx context.Context, cfg LocalPythonConfig, pat
 	if err != nil {
 		return localPythonBenchmarkRun{}, err
 	}
-	workDir, err := os.MkdirTemp("", "nats-service-tests-firecracker-*")
+	workDir, err := os.MkdirTemp("", "nats-sandbox-runtime-firecracker-*")
 	if err != nil {
 		return localPythonBenchmarkRun{}, fmt.Errorf("create firecracker work dir: %w", err)
 	}
 	defer os.RemoveAll(workDir)
 
-	marker := fmt.Sprintf("__NATS_SERVICE_TESTS_BENCH_%d__", run)
+	marker := fmt.Sprintf("__NATS_SANDBOX_RUNTIME_BENCH_%d__", run)
 	apiSock := filepath.Join(workDir, "firecracker.socket")
 	runPaths, err := prepareLocalPythonBenchmarkRunFiles(ctx, cfg, paths, workDir, run)
 	if err != nil {
@@ -711,7 +711,7 @@ func localPythonPrepareSnapshotInput(cfg LocalPythonConfig) string {
 		builder.WriteString("subprocess.run(['/usr/sbin/swapon', '/dev/vdc'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
 	}
 	builder.WriteString("subprocess.run(['/usr/bin/mount', '-o', 'remount,ro', '/'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
-	builder.WriteString("print('__NATS_SERVICE_TESTS_SNAPSHOT_READY__')\n")
+	builder.WriteString("print('__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__')\n")
 	return builder.String()
 }
 

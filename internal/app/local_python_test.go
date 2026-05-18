@@ -354,7 +354,7 @@ func TestLocalPythonSnapshotCheckAcceptsMatchingVersion(t *testing.T) {
 func TestLocalPythonPrepareSnapshotInputMountsWorkspaceAndProtectsSystem(t *testing.T) {
 	got := localPythonPrepareSnapshotInput(LocalPythonConfig{SwapMiB: 64})
 
-	if !containsAll(got, "mount", "/dev/vdb", "/workspace", "mkswap", "swapon", "remount,ro", "__NATS_SERVICE_TESTS_SNAPSHOT_READY__") {
+	if !containsAll(got, "mount", "/dev/vdb", "/workspace", "mkswap", "swapon", "remount,ro", "__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__") {
 		t.Fatalf("prepare snapshot input = %q, want workspace mount, swap setup, and root remount before snapshot", got)
 	}
 }

@@ -1,6 +1,6 @@
 {
-  "short_name": "Runtime",
-  "name": "NATS Runtime Console",
+  "short_name": "Sandbox",
+  "name": "NATS Sandbox Runtime Console",
   "icons": [
     {
       "src": "favicon.ico",

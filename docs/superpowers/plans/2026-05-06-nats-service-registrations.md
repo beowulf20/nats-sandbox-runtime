@@ -36,7 +36,7 @@
 
 **Files:**
 - Create: `internal/app/service.go`
-- Create: `cmd/nats-service-tests/main.go`
+- Create: `cmd/nats-sandbox-runtime/main.go`
 - Create: `README.md`
 
 - [x] Implement `Run(context.Context, Config, io.Writer) error`.
@@ -53,5 +53,5 @@
 
 - [x] Run `tmp/go/bin/gofmt -w ...`.
 - [x] Run `tmp/go/bin/go test ./internal/app ./internal/timestamp`.
-- [x] Run `tmp/go/bin/go test ./cmd/nats-service-tests ./internal/...`.
-- [x] Run `tmp/go/bin/go build -buildvcs=false -o /tmp/nats-service-tests-check ./cmd/nats-service-tests`.
+- [x] Run `tmp/go/bin/go test ./cmd/nats-sandbox-runtime ./internal/...`.
+- [x] Run `tmp/go/bin/go build -buildvcs=false -o /tmp/nats-sandbox-runtime-check ./cmd/nats-sandbox-runtime`.
