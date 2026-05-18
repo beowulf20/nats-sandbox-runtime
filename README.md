@@ -177,6 +177,50 @@ Stdout and stderr are returned as base64 NATS headers:
 - `Nats-Service-Tests-Python-Stdout-B64`
 - `Nats-Service-Tests-Python-Stderr-B64`
 
+## Go SDK V0
+
+The `pkg/pyruntime` SDK wraps the byte-only V0 flow for Go callers. It uploads input bytes to the runtime Object Store bucket, calls `python.run`, downloads every returned workspace artifact into memory, and best-effort deletes only the temporary SDK input objects.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"nats-service-tests/pkg/pyruntime"
+)
+
+func main() {
+	ctx := context.Background()
+	client, err := pyruntime.New(ctx, pyruntime.Config{
+		URL:    "nats://localhost:4222",
+		Bucket: "python-runtime-workspaces",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	result, err := client.Run(ctx, pyruntime.Request{
+		ThreadID: "conversation-42",
+		Code:     "from pathlib import Path\nPath('summary.txt').write_text(Path('input.txt').read_text().upper())",
+		Files: map[string][]byte{
+			"input.txt": []byte("hello\n"),
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(result.Stdout)
+	fmt.Printf("summary: %s\n", result.Files["summary.txt"])
+}
+```
+
+SDK V0 requires `ThreadID` because persistence is the intended workspace model, but the same scaling caveat applies: workspace continuity is only guaranteed when later requests land on the same runtime service instance. Run a single runtime service instance when thread continuity matters, or treat multiple instances as independent sandbox pools until workspace exchange is implemented.
+
 ## Control Plane
 
 Resize the worker pool while the service is running:
