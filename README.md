@@ -1,157 +1,249 @@
-# NATS Service Registration Test
+# NATS Python Sandbox Runtime
 
-Small Go service for testing how NATS handles multiple registrations of the same service when one instance disappears.
+This repo packages a NATS microservice that runs Python code inside a Firecracker microVM. It is meant for agent and automation workloads that need a disposable Python sandbox, a stable NATS request interface, and workspace artifacts stored outside the VM in JetStream Object Store.
 
-Each configured instance uses its own NATS connection and registers the same service:
+The main deployment target is:
 
-- NATS URL: `nats://localhost:4222`
-- Service name: `timestamp`
-- Endpoint subject: `time.now`
-- Response: `{"timestamp":"<RFC3339Nano UTC timestamp>"}`
+```text
+NATS request -> python.run -> worker pool -> Firecracker Python VM -> JetStream Object Store
+```
 
-## Run
+The runtime can also serve the local Horizon web console on the same process with `runtime api`.
 
-Start NATS locally on `localhost:4222`, then run:
+## What It Provides
+
+- `python.run`: executes inline Python or a Python object fetched from Object Store.
+- Isolated Firecracker workers: each worker owns a VM snapshot cache and runs one request at a time.
+- JetStream Object Store workspaces: input objects are copied into `/workspace`, and output files are uploaded as artifacts.
+- Optional thread persistence: `thread_id` keeps a workspace image warm for one hour.
+- Runtime controls: NATS subjects and HTTP API endpoints can resize workers and tune defaults for future runs.
+- Base64 stdout/stderr metadata headers so the JSON response stays focused on status, metrics, and artifact references.
+
+## Docker Image
+
+The Dockerfile builds three things into one runtime image:
+
+- the Go service binary;
+- the built `web/` console;
+- the Firecracker binary plus the checked-in kernel/rootfs assets needed by the Python guest.
+
+Build it:
 
 ```bash
-tmp/go/bin/go run ./cmd/nats-service-tests --instances 3
+docker build -t nats-python-runtime:local .
 ```
 
-Short flag:
+The image defaults to `runtime api`, listens on `0.0.0.0:8080`, and expects a NATS server named `nats` with JetStream enabled.
 
 ```bash
-tmp/go/bin/go run ./cmd/nats-service-tests -i 3
+docker run --rm \
+  --device=/dev/kvm \
+  --privileged \
+  -p 8080:8080 \
+  -e NATS_URL=nats://host.docker.internal:4222 \
+  -e NATS_BUCKET=python-runtime-workspaces \
+  nats-python-runtime:local
 ```
 
-## Request Timestamp
+Firecracker needs host KVM access. `--privileged` is the broad, simple development option. For production, replace it with a tighter runtime policy that still exposes `/dev/kvm` and permits Firecracker KVM ioctls.
 
-With the service running, request the timestamp endpoint:
+To run only the NATS microservice without the HTTP console:
 
 ```bash
-nats request time.now ''
+docker run --rm \
+  --device=/dev/kvm \
+  --privileged \
+  -e NATS_RUNTIME_MODE=python \
+  -e NATS_URL=nats://host.docker.internal:4222 \
+  nats-python-runtime:local
 ```
 
-Short form:
+You can also bypass the entrypoint defaults and pass the CLI directly:
 
 ```bash
-nats req time.now ''
+docker run --rm --device=/dev/kvm --privileged nats-python-runtime:local \
+  runtime python \
+  --url nats://host.docker.internal:4222 \
+  --bucket python-runtime-workspaces \
+  --workers 2
 ```
 
-Example response:
+## Runtime Configuration
 
-```json
-{"timestamp":"2026-05-06T16:34:56.000000789Z"}
-```
+The container entrypoint maps environment variables to CLI flags. Extra arguments passed to `docker run` are appended last, so explicit flags can override the environment.
 
-Inspect service registrations:
+| Environment variable | Default | CLI flag | Purpose |
+| --- | --- | --- | --- |
+| `NATS_RUNTIME_MODE` | `api` | `runtime api` / `runtime python` | Starts the HTTP console plus runtime, or only the NATS runtime. |
+| `RUNTIME_API_LISTEN` | `0.0.0.0:8080` | `--listen` | HTTP listen address for `runtime api`. |
+| `RUNTIME_API_WEB_DIR` | `/opt/nats-python-runtime/web/build` | `--web-dir` | Built frontend directory served by `runtime api`. |
+| `NATS_URL` | `nats://nats:4222` | `--url` | NATS server URL. JetStream must be enabled. |
+| `NATS_BUCKET` | `python-runtime-workspaces` | `--bucket` | Object Store bucket for input files and run artifacts. |
+| `NATS_RUNTIME_WORKERS` | `1` | `--workers` | Initial worker count. Each worker can run one request at a time. |
+| `NATS_RUNTIME_KERNEL` | packaged kernel | `--kernel` | Firecracker guest kernel path. |
+| `NATS_RUNTIME_ROOTFS` | packaged rootfs | `--rootfs` | Firecracker guest root filesystem path. |
+| `NATS_RUNTIME_FIRECRACKER` | `/usr/local/bin/firecracker` | `--firecracker` | Firecracker binary path. |
+| `NATS_RUNTIME_MEMORY_MIB` | `128` | `--memory-mib` | Default guest memory per run. |
+| `NATS_RUNTIME_SWAP_MIB` | `0` | `--swap-mib` | Default dedicated guest swap size. |
+| `NATS_RUNTIME_WORKSPACE_MIB` | `16` | `--workspace-mib` | Default writable `/workspace` ext4 size. |
+| `NATS_RUNTIME_VCPUS` | `1` | `--vcpus` | Guest vCPU count. |
+| `NATS_RUNTIME_MAX_VCPUS` | `1` | `--max-vcpus` | Hard cap for requested vCPUs. |
+| `NATS_RUNTIME_EXEC_TIMEOUT` | `5s` | `--exec-timeout` | Default Python execution timeout. |
+| `NATS_RUNTIME_TRUNCATE_LOG_MIB` | `1` | `--truncate-log-mib` | Max stdout/stderr MiB returned in metadata headers. `0` disables truncation. |
 
-```bash
-nats micro ls
-nats micro info timestamp
-```
+Per-request fields such as `memory_mib`, `swap_mib`, `workspace_mib`, and `exec_timeout` override the startup defaults for that run.
 
-Stop the process with Ctrl-C.
+## Scaling Warning
 
-## Local Firecracker Python
+NATS load-balances requests across service instances that subscribe to the same `python.run` subject. The runtime does not currently share live workspace images between service instances.
 
-Download a repo-local Firecracker binary first:
+That means `thread_id` workspace persistence is local to the service instance that handled the earlier request. If a later request with the same `thread_id` lands on a different service instance, that instance cannot reuse or exchange the first instance's workspace image. Run a single runtime service instance when thread workspace continuity matters, or treat multiple instances as independent sandbox pools until workspace exchange is implemented.
 
-```bash
-make firecracker
-```
+## NATS Request Examples
 
-Start a local Firecracker microVM with Python attached to the serial console:
-
-```bash
-tmp/go/bin/go run ./cmd/nats-service-tests local python
-```
-
-The first run creates a reusable snapshot cache in `firecracker-assets/python-snapshot`; later runs restore it for faster startup. Use `--snapshot-dir` to choose another cache location.
-Before each run, `tmp/workspace` is copied into a VM data drive and mounted read-write at `/workspace` before user code starts. Exec scripts run as an unprivileged guest user after the guest root filesystem has been remounted read-only, so scripts can write workspace files but cannot change system files, remount devices, or configure swap. Files written under `/workspace` are copied back to `tmp/workspace` after a single exec run. Use `--workspace-dir` to choose another directory.
-VM resources default to `128 MiB` RAM, a `16 MiB` workspace filesystem, no swap, and `1` vCPU. Use `--memory-mib` to choose any positive memory size, `--workspace-mib` to set the writable `/workspace` filesystem size, and `--swap-mib` to attach a dedicated `swap.raw` image as guest swap. CPU is capped at `1` vCPU unless you raise `--max-vcpus`; requests above the CPU cap are rejected before the VM starts.
-
-Run an inline Python command instead of the REPL:
-
-```bash
-tmp/go/bin/go run ./cmd/nats-service-tests local python --exec 'print("hello from vm")'
-```
-
-Run a Python script file instead:
-
-```bash
-tmp/go/bin/go run ./cmd/nats-service-tests local python --exec-file tmp/test-file.py
-```
-
-Hide Firecracker process logs:
-
-```bash
-tmp/go/bin/go run ./cmd/nats-service-tests local python --hide-firecracker-log --exec 'print("hello from vm")'
-```
-
-Benchmark snapshot restore to Python exec:
-
-```bash
-tmp/go/bin/go run ./cmd/nats-service-tests local python --exec 'print("bench")' --runs 30
-```
-
-Use `--parallel-runs` to run at most that many benchmark VMs at once:
-
-```bash
-tmp/go/bin/go run ./cmd/nats-service-tests local python --exec 'print("bench")' --runs 30 --parallel-runs 4
-```
-
-Benchmark output includes restore-to-exec latency, configured guest RAM/swap, host Firecracker process max RSS, average CPU percent over each run, and CPU time. Use `--exec-timeout` for benchmark scripts that take longer than the default `5s`. Parallel benchmark runs restore the same snapshot while using per-run copies of the workspace and swap images.
-
-The command uses `bin/firecracker`, `firecracker-assets/vmlinux.bin`, and `firecracker-assets/rootfs.ext4` by default. The guest logs `vm startup_ms=<ms>` when Python starts and `vm runtime_ms=<ms>` after Python exits while creating the snapshot. Use `--firecracker` to point at a different Firecracker binary.
-
-## NATS Python Runtime
-
-Run a NATS microservice that executes Python in a Firecracker VM and stores workspace artifacts in JetStream Object Store:
-
-```bash
-tmp/go/bin/go run ./cmd/nats-service-tests runtime python --bucket python-runtime-workspaces
-```
-
-The service listens on `python.run`. Request JSON can include inline code, Object Store-backed input files, and per-run resource overrides:
+Run a simple inline script:
 
 ```bash
 nats req python.run '{
-  "code": "from pathlib import Path\nPath(\"charts/status_counts.png\").write_text(\"ok\")\nprint(\"done\")",
-  "inputs": [
-    {"object": "datasets/iot-device-timestamps.json", "path": "iot-device-timestamps.json"}
-  ],
+  "code": "print(\"hello from firecracker\")"
+}'
+```
+
+Create an artifact:
+
+```bash
+nats req python.run '{
+  "run_id": "demo-artifact-1",
+  "code": "from pathlib import Path\nPath(\"reports/result.txt\").write_text(\"ok\\n\")\nprint(\"done\")",
   "workspace_mib": 32,
-  "thread_id": "conversation-42",
-  "memory_mib": 128,
   "exec_timeout": "10s"
 }'
 ```
 
-The JSON response includes run metrics and uploaded artifact object keys. Stdout and stderr are returned as base64 response metadata headers:
+Use an Object Store input and keep a short-lived thread workspace:
+
+```bash
+nats object put --name datasets/input.txt python-runtime-workspaces ./input.txt
+
+nats req python.run '{
+  "thread_id": "conversation-42",
+  "inputs": [
+    {"object": "datasets/input.txt", "path": "input.txt"}
+  ],
+  "code": "from pathlib import Path\ntext = Path(\"input.txt\").read_text()\nPath(\"summary.txt\").write_text(text.upper())"
+}'
+```
+
+Use code stored in Object Store:
+
+```bash
+nats object put --name code/job.py python-runtime-workspaces ./job.py
+
+nats req python.run '{
+  "code_object": "code/job.py",
+  "memory_mib": 256,
+  "exec_timeout": "30s"
+}'
+```
+
+The JSON response includes the run ID, status, VM restore-to-exec latency, resource sizes, worker ID, and uploaded artifact keys:
+
+```json
+{
+  "run_id": "demo-artifact-1",
+  "status": "ok",
+  "restore_exec_ms": 42,
+  "guest_ram_mib": 128,
+  "guest_swap_mib": 0,
+  "workspace_mib": 32,
+  "artifact_bucket": "python-runtime-workspaces",
+  "artifacts": [
+    {
+      "path": "reports/result.txt",
+      "object": "runs/demo-artifact-1/artifacts/reports/result.txt",
+      "size": 3
+    }
+  ],
+  "worker_id": "worker-1",
+  "stdout_header": "Nats-Service-Tests-Python-Stdout-B64",
+  "stderr_header": "Nats-Service-Tests-Python-Stderr-B64",
+  "stdout_truncated": false,
+  "stderr_truncated": false
+}
+```
+
+Stdout and stderr are returned as base64 NATS headers:
 
 - `Nats-Service-Tests-Python-Stdout-B64`
 - `Nats-Service-Tests-Python-Stderr-B64`
 
-The corresponding `*-Truncated` headers indicate whether the metadata was capped by `--truncate-log-mib`. Artifacts are uploaded under `runs/<run_id>/artifacts/<workspace-path>` in the configured bucket. Runtime workspace ext4 images persist for one hour only when `thread_id` is supplied; runs without `thread_id` use an ephemeral workspace image that is removed after the run.
+## Control Plane
 
-Runtime execution is handled by a worker pool. At startup, `--workers` sets the initial desired worker count, and each worker owns an isolated snapshot directory under `<snapshot-dir>/workers/<worker-id>`. Requests are assigned to the first idle worker. The desired worker count can be changed while the service is running:
+Resize the worker pool while the service is running:
 
 ```bash
 nats req python.control.workers.set '{"count":3}'
 nats req python.control.workers.list '{}'
 ```
 
-Increasing the count creates workers immediately. Decreasing it removes idle workers first and lets busy excess workers finish their current run before disappearing. Runtime defaults still apply to each worker, and per-run `python.run` resource fields have final precedence.
+Runtime defaults can also be inspected and changed over NATS:
 
-## Local Runtime API Console
+```bash
+nats req python.control.settings.list '{}'
+nats req python.control.settings.set '{"key":"runtime.default_memory_mib","value":256}'
+nats req python.control.settings.get '{"key":"runtime.default_memory_mib"}'
+nats req python.control.settings.delete '{"key":"runtime.default_memory_mib"}'
+```
 
-Run the Python runtime and a local Horizon UI console from one process:
+Known setting keys:
+
+- `runtime.default_memory_mib`
+- `runtime.default_swap_mib`
+- `runtime.default_workspace_mib`
+- `runtime.default_exec_timeout`
+
+When `runtime api` is enabled, the same controls are exposed through the local HTTP API and the web console:
+
+- `GET /api/overview`
+- `GET /api/workers`
+- `GET /api/workers/events`
+- `PUT /api/workers`
+- `GET /api/snapshots`
+- `DELETE /api/snapshots/workers/{worker_id}`
+- `GET /api/workspaces`
+- `DELETE /api/workspaces/{key}`
+- `GET /api/settings`
+- `GET /api/settings/{key}`
+- `PUT /api/settings/{key}`
+- `DELETE /api/settings/{key}`
+
+## Isolation Model
+
+The service process runs on the host or in the container and talks to NATS. User Python does not run in that process. Each request is copied into a Firecracker guest and executed from `/workspace` as an unprivileged guest user.
+
+Before user code runs, the guest root filesystem is remounted read-only. The writable area is a per-run or per-thread ext4 workspace image. After the run, files under `/workspace` are copied back out and uploaded to Object Store under:
+
+```text
+runs/<run_id>/artifacts/<workspace-path>
+```
+
+This design keeps the API simple: callers exchange JSON, Object Store keys, and NATS headers, while the runtime handles VM restore, workspace hydration, artifact upload, and cleanup.
+
+## Local Development
+
+Build the Go binary:
+
+```bash
+make build
+```
+
+Run the runtime API directly:
 
 ```bash
 tmp/go/bin/go run ./cmd/nats-service-tests runtime api --bucket python-runtime-workspaces
 ```
 
-The API listens on `127.0.0.1:8080` by default and serves `web/build`. Build the frontend first:
+Build the frontend first when serving the console without Docker:
 
 ```bash
 cd web
@@ -159,44 +251,40 @@ npm install
 npm run build
 ```
 
-Open `http://127.0.0.1:8080` for the console. The lateral navigation includes:
-
-- `Overview`: NATS connection and runtime service status
-- `Workers`: current worker pool status and desired worker count
-- `Snapshots`: VM snapshot file status and per-worker reset
-- `Workspaces`: one-hour persistent workspace ext4 image status by thread ID
-- `Settings`: discoverable runtime defaults that affect future Python runs
-
-For local development with reloadable server and UI processes, run:
+For reloadable Go and React development:
 
 ```bash
 make dev
 ```
 
-The dev target runs Air for the Go runtime API on `127.0.0.1:8080` and the React dev server on `127.0.0.1:3000`. The UI dev server proxies `/api/*` requests to the runtime API. Override ports as needed:
+The dev target runs the Go runtime API on `127.0.0.1:8080` and the React dev server on `127.0.0.1:3000`.
+
+## Local Firecracker Python Helper
+
+For one-off local VM checks without NATS:
 
 ```bash
-make dev RUNTIME_API_LISTEN=127.0.0.1:8081 WEB_PORT=3001
+tmp/go/bin/go run ./cmd/nats-service-tests local python --exec 'print("hello from vm")'
 ```
 
-The local JSON endpoints are:
+Useful flags include:
 
-- `GET /api/overview`
-- `GET /api/workers`
-- `GET /api/workers/events` for Server-Sent Events with live worker snapshots
-- `PUT /api/workers` with `{"count": <integer>}`
-- `GET /api/snapshots`
-- `DELETE /api/snapshots/workers/{worker_id}` to reset VM snapshot files for an idle worker
-- `GET /api/workspaces`
-- `DELETE /api/workspaces/{key}` to reset an idle thread workspace ext4 image
-- `GET /api/settings` for discoverable effective runtime settings
-- `GET /api/settings/{key}`
-- `PUT /api/settings/{key}` with `{"value": <json>}`
-- `DELETE /api/settings/{key}` to reset a known setting to the startup default
+- `--snapshot-dir`
+- `--workspace-dir`
+- `--memory-mib`
+- `--swap-mib`
+- `--workspace-mib`
+- `--exec-timeout`
+- `--runs`
+- `--parallel-runs`
 
-Known settings are:
+## Legacy Timestamp Service
 
-- `runtime.default_memory_mib`
-- `runtime.default_swap_mib`
-- `runtime.default_workspace_mib`
-- `runtime.default_exec_timeout`
+The root command still contains the original NATS service registration test:
+
+```bash
+tmp/go/bin/go run ./cmd/nats-service-tests --instances 3
+nats req time.now ''
+```
+
+It registers the `timestamp` service on `time.now` and returns an RFC3339Nano UTC timestamp.
