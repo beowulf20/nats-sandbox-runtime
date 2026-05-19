@@ -32,6 +32,8 @@ common_args="
 	--max-vcpus ${NATS_RUNTIME_MAX_VCPUS:-1}
 	--exec-timeout ${NATS_RUNTIME_EXEC_TIMEOUT:-5s}
 	--truncate-log-mib ${NATS_RUNTIME_TRUNCATE_LOG_MIB:-1}
+	--artifact-ttl ${NATS_RUNTIME_ARTIFACT_TTL:-24h}
+	--artifact-cleanup-interval ${NATS_RUNTIME_ARTIFACT_CLEANUP_INTERVAL:-1h}
 "
 
 if [ "${mode}" = "api" ]; then

@@ -14,6 +14,7 @@ import (
 
 type NATSDeploymentTestConfig struct {
 	URL     string
+	Token   string
 	Bucket  string
 	Subject string
 	Payload string
@@ -22,8 +23,8 @@ type NATSDeploymentTestConfig struct {
 
 func defaultNATSDeploymentTestConfig() NATSDeploymentTestConfig {
 	return NATSDeploymentTestConfig{
-		URL:     LocalNATSURL,
-		Bucket:  defaultRuntimeBucket,
+		URL:     envString("NATS_URL", LocalNATSURL),
+		Bucket:  envString("NATS_BUCKET", defaultRuntimeBucket),
 		Timeout: 5 * time.Second,
 	}
 }
@@ -46,7 +47,8 @@ func RunNATSDeploymentTest(ctx context.Context, cfg NATSDeploymentTestConfig, ou
 		return err
 	}
 
-	nc, err := nats.Connect(cfg.URL, nats.Name("nats-sandbox-runtime-test"), nats.Timeout(cfg.Timeout))
+	opts := append(natsConnectOptions("nats-sandbox-runtime-test", cfg.Token), nats.Timeout(cfg.Timeout))
+	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
 		return fmt.Errorf("connect nats: %w", err)
 	}

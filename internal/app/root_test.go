@@ -156,7 +156,7 @@ func TestRuntimePythonCommandAcceptsServiceConfig(t *testing.T) {
 		got = cfg
 		return nil
 	})
-	cmd.SetArgs([]string{"runtime", "python", "--url", "nats://demo:4222", "--bucket", "PY", "--workers", "3", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "20s", "--truncate-log-mib", "2"})
+	cmd.SetArgs([]string{"runtime", "python", "--url", "nats://demo:4222", "--token", "secret", "--bucket", "PY", "--workers", "3", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "20s", "--truncate-log-mib", "2", "--artifact-ttl", "12h", "--artifact-cleanup-interval", "30m"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute returned error: %v", err)
@@ -164,6 +164,9 @@ func TestRuntimePythonCommandAcceptsServiceConfig(t *testing.T) {
 
 	if got.URL != "nats://demo:4222" {
 		t.Fatalf("URL = %q, want override", got.URL)
+	}
+	if got.Token != "secret" {
+		t.Fatalf("Token = %q, want secret", got.Token)
 	}
 	if got.Bucket != "PY" {
 		t.Fatalf("Bucket = %q, want override", got.Bucket)
@@ -183,6 +186,42 @@ func TestRuntimePythonCommandAcceptsServiceConfig(t *testing.T) {
 	if got.TruncateLogMiB != 2 {
 		t.Fatalf("TruncateLogMiB = %d, want 2", got.TruncateLogMiB)
 	}
+	if got.ArtifactTTL != 12*time.Hour {
+		t.Fatalf("ArtifactTTL = %s, want 12h", got.ArtifactTTL)
+	}
+	if got.CleanupInterval != 30*time.Minute {
+		t.Fatalf("CleanupInterval = %s, want 30m", got.CleanupInterval)
+	}
+}
+
+func TestRuntimePythonCommandUsesNATSEnvironmentDefaults(t *testing.T) {
+	t.Setenv("NATS_URL", "nats://env:4222")
+	t.Setenv("NATS_BUCKET", "ENV_BUCKET")
+	t.Setenv("NATS_TOKEN", "env-secret")
+
+	var got RuntimePythonConfig
+	cmd := NewRootCommand(nil, nil, func(ctx context.Context, cfg RuntimePythonConfig) error {
+		got = cfg
+		return nil
+	})
+	cmd.SetArgs([]string{"runtime", "python"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if got.URL != "nats://env:4222" {
+		t.Fatalf("URL = %q, want env URL", got.URL)
+	}
+	if got.Bucket != "ENV_BUCKET" {
+		t.Fatalf("Bucket = %q, want env bucket", got.Bucket)
+	}
+	if got.Token != "" {
+		t.Fatalf("Token = %q, want empty config token so env secret is not exposed in command defaults", got.Token)
+	}
+	if token := natsConnectToken(got.Token); token != "env-secret" {
+		t.Fatalf("resolved token = %q, want env token", token)
+	}
 }
 
 func TestRuntimeAPICommandAcceptsServiceAndHTTPConfig(t *testing.T) {
@@ -191,7 +230,7 @@ func TestRuntimeAPICommandAcceptsServiceAndHTTPConfig(t *testing.T) {
 		got = cfg
 		return nil
 	})
-	cmd.SetArgs([]string{"runtime", "api", "--listen", "127.0.0.1:9090", "--web-dir", "web/build", "--url", "nats://demo:4222", "--bucket", "PY", "--workers", "3", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "20s", "--truncate-log-mib", "2"})
+	cmd.SetArgs([]string{"runtime", "api", "--listen", "127.0.0.1:9090", "--web-dir", "web/build", "--url", "nats://demo:4222", "--token", "secret", "--bucket", "PY", "--workers", "3", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "20s", "--truncate-log-mib", "2", "--artifact-ttl", "12h", "--artifact-cleanup-interval", "30m"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute returned error: %v", err)
@@ -205,6 +244,9 @@ func TestRuntimeAPICommandAcceptsServiceAndHTTPConfig(t *testing.T) {
 	}
 	if got.Runtime.URL != "nats://demo:4222" {
 		t.Fatalf("URL = %q, want override", got.Runtime.URL)
+	}
+	if got.Runtime.Token != "secret" {
+		t.Fatalf("Token = %q, want secret", got.Runtime.Token)
 	}
 	if got.Runtime.Bucket != "PY" {
 		t.Fatalf("Bucket = %q, want override", got.Runtime.Bucket)
@@ -224,6 +266,12 @@ func TestRuntimeAPICommandAcceptsServiceAndHTTPConfig(t *testing.T) {
 	if got.Runtime.TruncateLogMiB != 2 {
 		t.Fatalf("TruncateLogMiB = %d, want 2", got.Runtime.TruncateLogMiB)
 	}
+	if got.Runtime.ArtifactTTL != 12*time.Hour {
+		t.Fatalf("ArtifactTTL = %s, want 12h", got.Runtime.ArtifactTTL)
+	}
+	if got.Runtime.CleanupInterval != 30*time.Minute {
+		t.Fatalf("CleanupInterval = %s, want 30m", got.Runtime.CleanupInterval)
+	}
 }
 
 func TestRuntimeAPICommandRejectsInvalidConfig(t *testing.T) {
@@ -231,6 +279,8 @@ func TestRuntimeAPICommandRejectsInvalidConfig(t *testing.T) {
 		{"runtime", "api", "--listen", ""},
 		{"runtime", "api", "--web-dir", ""},
 		{"runtime", "api", "--workers", "0"},
+		{"runtime", "api", "--artifact-ttl", "-1s"},
+		{"runtime", "api", "--artifact-cleanup-interval", "-1s"},
 	} {
 		cmd := NewRootCommandWithRuntimeAPI(nil, nil, nil, func(ctx context.Context, cfg RuntimeAPIConfig) error {
 			t.Fatalf("runner should not be called for invalid config")
@@ -250,7 +300,7 @@ func TestNATSDeploymentTestCommandAcceptsConfig(t *testing.T) {
 		got = cfg
 		return nil
 	})
-	cmd.SetArgs([]string{"test", "nats", "--url", "nats://demo:4222", "--bucket", "PY", "--subject", "python.control.settings.list", "--payload", "{}", "--timeout", "3s"})
+	cmd.SetArgs([]string{"test", "nats", "--url", "nats://demo:4222", "--token", "secret", "--bucket", "PY", "--subject", "python.control.settings.list", "--payload", "{}", "--timeout", "3s"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute returned error: %v", err)
@@ -258,6 +308,9 @@ func TestNATSDeploymentTestCommandAcceptsConfig(t *testing.T) {
 
 	if got.URL != "nats://demo:4222" {
 		t.Fatalf("URL = %q, want override", got.URL)
+	}
+	if got.Token != "secret" {
+		t.Fatalf("Token = %q, want secret", got.Token)
 	}
 	if got.Bucket != "PY" {
 		t.Fatalf("Bucket = %q, want override", got.Bucket)
@@ -270,6 +323,36 @@ func TestNATSDeploymentTestCommandAcceptsConfig(t *testing.T) {
 	}
 	if got.Timeout != 3*time.Second {
 		t.Fatalf("Timeout = %s, want 3s", got.Timeout)
+	}
+}
+
+func TestNATSDeploymentTestCommandUsesNATSEnvironmentDefaults(t *testing.T) {
+	t.Setenv("NATS_URL", "nats://env:4222")
+	t.Setenv("NATS_BUCKET", "ENV_BUCKET")
+	t.Setenv("NATS_TOKEN", "env-secret")
+
+	var got NATSDeploymentTestConfig
+	cmd := NewRootCommandWithRuntimeAPI(nil, nil, nil, nil, func(ctx context.Context, cfg NATSDeploymentTestConfig) error {
+		got = cfg
+		return nil
+	})
+	cmd.SetArgs([]string{"test", "nats"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if got.URL != "nats://env:4222" {
+		t.Fatalf("URL = %q, want env URL", got.URL)
+	}
+	if got.Bucket != "ENV_BUCKET" {
+		t.Fatalf("Bucket = %q, want env bucket", got.Bucket)
+	}
+	if got.Token != "" {
+		t.Fatalf("Token = %q, want empty config token so env secret is not exposed in command defaults", got.Token)
+	}
+	if token := natsConnectToken(got.Token); token != "env-secret" {
+		t.Fatalf("resolved token = %q, want env token", token)
 	}
 }
 
@@ -291,13 +374,39 @@ func TestNATSDeploymentTestCommandRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+func TestRuntimeREPLCommandUsesNATSEnvironmentDefaults(t *testing.T) {
+	t.Setenv("NATS_URL", "nats://env:4222")
+	t.Setenv("NATS_TOKEN", "env-secret")
+
+	var got RuntimeREPLConfig
+	cmd := NewRootCommandWithRuntimeAPIAndTools(nil, nil, nil, nil, nil, func(ctx context.Context, cfg RuntimeREPLConfig) error {
+		got = cfg
+		return nil
+	})
+	cmd.SetArgs([]string{"test", "repl"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if got.URL != "nats://env:4222" {
+		t.Fatalf("URL = %q, want env URL", got.URL)
+	}
+	if got.Token != "" {
+		t.Fatalf("Token = %q, want empty config token so env secret is not exposed in command defaults", got.Token)
+	}
+	if token := natsConnectToken(got.Token); token != "env-secret" {
+		t.Fatalf("resolved token = %q, want env token", token)
+	}
+}
+
 func TestRuntimeREPLCommandAcceptsConfig(t *testing.T) {
 	var got RuntimeREPLConfig
 	cmd := NewRootCommandWithRuntimeAPIAndTools(nil, nil, nil, nil, nil, func(ctx context.Context, cfg RuntimeREPLConfig) error {
 		got = cfg
 		return nil
 	})
-	cmd.SetArgs([]string{"test", "repl", "--url", "nats://demo:4222", "--timeout", "3s", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "10s"})
+	cmd.SetArgs([]string{"test", "repl", "--url", "nats://demo:4222", "--token", "secret", "--timeout", "3s", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "10s"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute returned error: %v", err)
@@ -305,6 +414,9 @@ func TestRuntimeREPLCommandAcceptsConfig(t *testing.T) {
 
 	if got.URL != "nats://demo:4222" {
 		t.Fatalf("URL = %q, want override", got.URL)
+	}
+	if got.Token != "secret" {
+		t.Fatalf("Token = %q, want secret", got.Token)
 	}
 	if got.Timeout != 3*time.Second {
 		t.Fatalf("Timeout = %s, want 3s", got.Timeout)

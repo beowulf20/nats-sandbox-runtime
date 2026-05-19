@@ -117,7 +117,7 @@ nats-sandbox-runtime test repl \
 
 ## Runtime Configuration
 
-The container entrypoint maps environment variables to CLI flags. Extra arguments passed to `docker run` are appended last, so explicit flags can override the environment.
+The runtime binary and container entrypoint both read these environment variables. Extra arguments passed to `docker run` are appended last, so explicit flags can override the environment.
 
 | Environment variable | Default | CLI flag | Purpose |
 | --- | --- | --- | --- |
@@ -125,6 +125,7 @@ The container entrypoint maps environment variables to CLI flags. Extra argument
 | `RUNTIME_API_LISTEN` | `0.0.0.0:8080` | `--listen` | HTTP listen address for `runtime api`. |
 | `RUNTIME_API_WEB_DIR` | `/opt/nats-sandbox-runtime/web/build` | `--web-dir` | Built frontend directory served by `runtime api`. |
 | `NATS_URL` | `nats://nats:4222` | `--url` | NATS server URL. JetStream must be enabled. |
+| `NATS_TOKEN` | empty | `--token` | NATS authentication token. The runtime also reads this env var directly when `--token` is omitted. |
 | `NATS_BUCKET` | `python-runtime-workspaces` | `--bucket` | Object Store bucket for input files and run artifacts. |
 | `NATS_RUNTIME_WORKERS` | `1` | `--workers` | Initial worker count. Each worker can run one request at a time. |
 | `NATS_RUNTIME_KERNEL` | packaged kernel | `--kernel` | Firecracker guest kernel path. |
@@ -137,8 +138,58 @@ The container entrypoint maps environment variables to CLI flags. Extra argument
 | `NATS_RUNTIME_MAX_VCPUS` | `1` | `--max-vcpus` | Hard cap for requested vCPUs. |
 | `NATS_RUNTIME_EXEC_TIMEOUT` | `5s` | `--exec-timeout` | Default Python execution timeout. |
 | `NATS_RUNTIME_TRUNCATE_LOG_MIB` | `1` | `--truncate-log-mib` | Max stdout/stderr MiB returned in metadata headers. `0` disables truncation. |
+| `NATS_RUNTIME_ARTIFACT_TTL` | `24h` | `--artifact-ttl` | Max age for runtime artifact objects. `0s` disables runtime artifact cleanup. |
+| `NATS_RUNTIME_ARTIFACT_CLEANUP_INTERVAL` | `1h` | `--artifact-cleanup-interval` | How often the runtime checks for expired artifact objects that still exist. `0s` disables the checker. |
 
 Per-request fields such as `memory_mib`, `swap_mib`, `workspace_mib`, and `exec_timeout` override the startup defaults for that run.
+
+Runtime artifacts uploaded under `runs/<run_id>/artifacts/...` expire after `NATS_RUNTIME_ARTIFACT_TTL`. The runtime runs a periodic cleanup checker to delete expired runtime artifact objects if they are still present. The checker does not delete SDK inputs, user-provided datasets, or other objects outside the runtime artifact prefix. The NATS Object Store bucket itself does not use native bucket-wide TTL, because that would also expire non-artifact objects in the same bucket.
+
+## NATS Auth Subjects
+
+For token authentication, start NATS with a token and pass the same value to the runtime:
+
+```bash
+nats-server -js --auth "$NATS_TOKEN"
+nats-sandbox-runtime runtime api --token "$NATS_TOKEN"
+```
+
+In containers, prefer setting `NATS_TOKEN` as an environment variable. The entrypoint leaves it in the environment and the runtime reads it at connection time, instead of expanding the secret into process arguments.
+
+For user/account permissions, the runtime service needs to subscribe to these request and service-monitoring subjects:
+
+```text
+python.run
+python.control.settings.get
+python.control.settings.set
+python.control.settings.delete
+python.control.settings.list
+python.control.workers.set
+python.control.workers.list
+$SRV.PING
+$SRV.PING.python-runtime
+$SRV.PING.python-runtime.>
+$SRV.INFO
+$SRV.INFO.python-runtime
+$SRV.INFO.python-runtime.>
+$SRV.STATS
+$SRV.STATS.python-runtime
+$SRV.STATS.python-runtime.>
+_INBOX.>
+$O.python-runtime-workspaces.C.>
+$O.python-runtime-workspaces.M.>
+```
+
+The runtime service needs to publish to these reply, JetStream API, and Object Store subjects:
+
+```text
+_INBOX.>
+$JS.API.>
+$O.python-runtime-workspaces.C.>
+$O.python-runtime-workspaces.M.>
+```
+
+Replace `python-runtime-workspaces` in the `$O...` subjects when `NATS_BUCKET` is changed.
 
 ## Scaling Warning
 

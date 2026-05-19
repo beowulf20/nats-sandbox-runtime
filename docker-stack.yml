@@ -1,0 +1,85 @@
+version: "3.8"
+
+# Portainer Swarm stack for nats-sandbox-runtime.
+# Before deploying, publish the runtime image to a registry reachable by the
+# Swarm nodes or replace NATS_SANDBOX_RUNTIME_IMAGE with that image name.
+# Label one KVM-capable node first:
+# docker node update --label-add kvm=true <node-name>
+
+services:
+  nats:
+    image: nats:2-alpine
+    command:
+      - -js
+      - -sd
+      - /data
+      - -m
+      - "8222"
+      - --auth
+      - ${NATS_TOKEN:-change-me}
+    ports:
+      - target: 4222
+        published: 4222
+        protocol: tcp
+        mode: ingress
+      - target: 8222
+        published: 8222
+        protocol: tcp
+        mode: ingress
+    volumes:
+      - nats-data:/data
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  runtime:
+    image: ${NATS_SANDBOX_RUNTIME_IMAGE:-nats-sandbox-runtime:local}
+    environment:
+      NATS_RUNTIME_MODE: api
+      NATS_URL: nats://nats:4222
+      NATS_TOKEN: ${NATS_TOKEN:-change-me}
+      NATS_BUCKET: python-runtime-workspaces
+      NATS_RUNTIME_WORKERS: "1"
+      NATS_RUNTIME_MEMORY_MIB: "128"
+      NATS_RUNTIME_SWAP_MIB: "256"
+      NATS_RUNTIME_WORKSPACE_MIB: "16"
+      NATS_RUNTIME_VCPUS: "1"
+      NATS_RUNTIME_MAX_VCPUS: "1"
+      NATS_RUNTIME_EXEC_TIMEOUT: 5s
+      NATS_RUNTIME_TRUNCATE_LOG_MIB: "1"
+      NATS_RUNTIME_ARTIFACT_TTL: 24h
+      NATS_RUNTIME_ARTIFACT_CLEANUP_INTERVAL: 1h
+      RUNTIME_API_LISTEN: 0.0.0.0:8080
+    ports:
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: ingress
+    volumes:
+      - runtime-snapshots:/opt/nats-sandbox-runtime/firecracker-assets/python-snapshot
+      - runtime-workspaces:/opt/nats-sandbox-runtime/tmp
+    devices:
+      - /dev/kvm:/dev/kvm
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    depends_on:
+      - nats
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.kvm == true
+      restart_policy:
+        condition: on-failure
+      resources:
+        reservations:
+          memory: 512M
+        limits:
+          memory: 2G
+
+volumes:
+  nats-data:
+  runtime-snapshots:
+  runtime-workspaces:

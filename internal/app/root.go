@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -24,6 +25,8 @@ const (
 	defaultParallelRuns     = 1
 	defaultWorkspaceMiB     = 16
 	defaultRuntimeBucket    = "python-runtime-workspaces"
+	defaultArtifactTTL      = 24 * time.Hour
+	defaultArtifactCleanup  = time.Hour
 	defaultMaxParallelRuns  = 1
 	defaultRuntimeAPIListen = "127.0.0.1:8080"
 	defaultRuntimeAPIWebDir = "web/build"
@@ -58,13 +61,16 @@ type LocalPythonConfig struct {
 }
 
 type RuntimePythonConfig struct {
-	URL            string
-	Bucket         string
-	MaxParallel    int
-	LocalPython    LocalPythonConfig
-	StdoutHeader   string
-	StderrHeader   string
-	TruncateLogMiB int64
+	URL             string
+	Token           string
+	Bucket          string
+	MaxParallel     int
+	LocalPython     LocalPythonConfig
+	StdoutHeader    string
+	StderrHeader    string
+	TruncateLogMiB  int64
+	ArtifactTTL     time.Duration
+	CleanupInterval time.Duration
 }
 
 type RuntimeAPIConfig struct {
@@ -289,14 +295,24 @@ func defaultRuntimePythonConfig() RuntimePythonConfig {
 	localCfg := defaultLocalPythonConfig()
 	localCfg.HideFirecrackerLog = true
 	return RuntimePythonConfig{
-		URL:            LocalNATSURL,
-		Bucket:         defaultRuntimeBucket,
-		MaxParallel:    defaultMaxParallelRuns,
-		LocalPython:    localCfg,
-		StdoutHeader:   "Nats-Sandbox-Runtime-Python-Stdout-B64",
-		StderrHeader:   "Nats-Sandbox-Runtime-Python-Stderr-B64",
-		TruncateLogMiB: 1,
+		URL:             envString("NATS_URL", LocalNATSURL),
+		Token:           "",
+		Bucket:          envString("NATS_BUCKET", defaultRuntimeBucket),
+		MaxParallel:     defaultMaxParallelRuns,
+		LocalPython:     localCfg,
+		StdoutHeader:    "Nats-Sandbox-Runtime-Python-Stdout-B64",
+		StderrHeader:    "Nats-Sandbox-Runtime-Python-Stderr-B64",
+		TruncateLogMiB:  1,
+		ArtifactTTL:     defaultArtifactTTL,
+		CleanupInterval: defaultArtifactCleanup,
 	}
+}
+
+func envString(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func validateRuntimePythonConfig(cfg RuntimePythonConfig) error {
@@ -311,6 +327,12 @@ func validateRuntimePythonConfig(cfg RuntimePythonConfig) error {
 	}
 	if cfg.TruncateLogMiB < 0 {
 		return fmt.Errorf("truncate-log-mib must be at least 0")
+	}
+	if cfg.ArtifactTTL < 0 {
+		return fmt.Errorf("artifact-ttl must be at least 0")
+	}
+	if cfg.CleanupInterval < 0 {
+		return fmt.Errorf("artifact-cleanup-interval must be at least 0")
 	}
 	return nil
 }
@@ -327,12 +349,15 @@ func addRuntimePythonFlags(cmd *cobra.Command, runtimeCfg *RuntimePythonConfig) 
 	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.MaxVCPUs, "max-vcpus", runtimeCfg.LocalPython.MaxVCPUs, "maximum allowed microVM vCPU count")
 	cmd.Flags().DurationVar(&runtimeCfg.LocalPython.ExecTimeout, "exec-timeout", runtimeCfg.LocalPython.ExecTimeout, "default maximum time to wait for Python exec completion")
 	cmd.Flags().StringVar(&runtimeCfg.URL, "url", runtimeCfg.URL, "NATS server URL")
+	cmd.Flags().StringVar(&runtimeCfg.Token, "token", runtimeCfg.Token, "NATS authentication token")
 	cmd.Flags().StringVar(&runtimeCfg.Bucket, "bucket", runtimeCfg.Bucket, "NATS Object Store bucket for runtime workspaces")
 	cmd.Flags().IntVar(&runtimeCfg.MaxParallel, "workers", runtimeCfg.MaxParallel, "initial runtime worker count")
 	cmd.Flags().IntVar(&runtimeCfg.MaxParallel, "max-parallel", runtimeCfg.MaxParallel, "deprecated alias for --workers")
 	cmd.Flags().StringVar(&runtimeCfg.StdoutHeader, "stdout-header", runtimeCfg.StdoutHeader, "response header used for base64 stdout metadata")
 	cmd.Flags().StringVar(&runtimeCfg.StderrHeader, "stderr-header", runtimeCfg.StderrHeader, "response header used for base64 stderr metadata")
 	cmd.Flags().Int64Var(&runtimeCfg.TruncateLogMiB, "truncate-log-mib", runtimeCfg.TruncateLogMiB, "maximum stdout/stderr MiB returned in response metadata; 0 disables truncation")
+	cmd.Flags().DurationVar(&runtimeCfg.ArtifactTTL, "artifact-ttl", runtimeCfg.ArtifactTTL, "maximum age for runtime artifact objects; 0 disables artifact cleanup")
+	cmd.Flags().DurationVar(&runtimeCfg.CleanupInterval, "artifact-cleanup-interval", runtimeCfg.CleanupInterval, "interval for runtime artifact cleanup checks; 0 disables the background checker")
 }
 
 func newTestCommand(runNATSDeploymentTest func(context.Context, NATSDeploymentTestConfig) error, runRuntimeREPL func(context.Context, RuntimeREPLConfig) error) *cobra.Command {
@@ -362,6 +387,7 @@ func newTestNATSCommand(runNATSDeploymentTest func(context.Context, NATSDeployme
 		},
 	}
 	cmd.Flags().StringVar(&cfg.URL, "url", cfg.URL, "NATS server URL")
+	cmd.Flags().StringVar(&cfg.Token, "token", cfg.Token, "NATS authentication token")
 	cmd.Flags().StringVar(&cfg.Bucket, "bucket", cfg.Bucket, "NATS Object Store bucket to verify; empty skips bucket verification")
 	cmd.Flags().StringVar(&cfg.Subject, "subject", cfg.Subject, "optional NATS subject to request")
 	cmd.Flags().StringVar(&cfg.Payload, "payload", cfg.Payload, "request payload sent when --subject is set")
@@ -386,6 +412,7 @@ func newTestREPLCommand(runRuntimeREPL func(context.Context, RuntimeREPLConfig) 
 		},
 	}
 	cmd.Flags().StringVar(&cfg.URL, "url", cfg.URL, "NATS server URL")
+	cmd.Flags().StringVar(&cfg.Token, "token", cfg.Token, "NATS authentication token")
 	cmd.Flags().DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "connection and per-request timeout")
 	cmd.Flags().Int64Var(&cfg.MemoryMiB, "memory-mib", cfg.MemoryMiB, "per-request guest memory override in MiB; 0 omits the field")
 	cmd.Flags().Int64Var(&cfg.WorkspaceMiB, "workspace-mib", cfg.WorkspaceMiB, "per-request workspace size override in MiB; 0 omits the field")

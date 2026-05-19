@@ -21,6 +21,7 @@ const (
 
 type RuntimeREPLConfig struct {
 	URL          string
+	Token        string
 	Timeout      time.Duration
 	MemoryMiB    int64
 	WorkspaceMiB int64
@@ -46,7 +47,7 @@ type runtimeREPLInput struct {
 
 func defaultRuntimeREPLConfig() RuntimeREPLConfig {
 	return RuntimeREPLConfig{
-		URL:     LocalNATSURL,
+		URL:     envString("NATS_URL", LocalNATSURL),
 		Timeout: defaultRuntimeREPLTimeout,
 	}
 }
@@ -81,7 +82,8 @@ func RunRuntimeREPL(ctx context.Context, cfg RuntimeREPLConfig, stdin io.Reader,
 		return err
 	}
 
-	nc, err := nats.Connect(cfg.URL, nats.Name("nats-sandbox-runtime-test-repl"), nats.Timeout(cfg.Timeout))
+	opts := append(natsConnectOptions("nats-sandbox-runtime-test-repl", cfg.Token), nats.Timeout(cfg.Timeout))
+	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
 		return fmt.Errorf("connect nats: %w", err)
 	}
