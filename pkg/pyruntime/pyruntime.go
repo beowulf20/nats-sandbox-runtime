@@ -129,16 +129,12 @@ func (c *Client) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 
 	runID := newRunID()
-	uploaded := make([]string, 0, len(files))
-	defer cleanupObjects(ctx, c.store, &uploaded)
-
 	inputs := make([]pythonRunObjectMapping, 0, len(files))
 	for _, file := range files {
 		objectName := "sdk-inputs/" + runID + "/" + file.path
 		if _, err := c.store.PutBytes(ctx, objectName, file.data); err != nil {
 			return nil, fmt.Errorf("upload input %q: %w", file.path, err)
 		}
-		uploaded = append(uploaded, objectName)
 		inputs = append(inputs, pythonRunObjectMapping{
 			Object: objectName,
 			Path:   file.path,
@@ -194,7 +190,6 @@ type requester interface {
 type objectStore interface {
 	PutBytes(ctx context.Context, name string, data []byte) (*jetstream.ObjectInfo, error)
 	GetBytes(ctx context.Context, name string, opts ...jetstream.GetObjectOpt) ([]byte, error)
-	Delete(ctx context.Context, name string) error
 }
 
 type pythonRunRequest struct {
@@ -356,12 +351,6 @@ func microError(msg *nats.Msg) error {
 		return fmt.Errorf("python runtime error %s", code)
 	}
 	return fmt.Errorf("python runtime error %s: %s", code, description)
-}
-
-func cleanupObjects(ctx context.Context, store objectStore, names *[]string) {
-	for _, name := range *names {
-		_ = store.Delete(ctx, name)
-	}
 }
 
 func newRunID() string {

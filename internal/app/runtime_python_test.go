@@ -216,9 +216,9 @@ func TestWrapRuntimePythonCodeAddsMarkers(t *testing.T) {
 	}
 }
 
-func TestCleanupRuntimeArtifactsDeletesOnlyExpiredRuntimeArtifacts(t *testing.T) {
+func TestCleanupRuntimeObjectsDeletesOnlyExpiredRuntimeOwnedObjects(t *testing.T) {
 	now := time.Now()
-	store := &fakeRuntimeArtifactStore{objects: map[string]*jetstream.ObjectInfo{
+	store := &fakeRuntimeObjectStore{objects: map[string]*jetstream.ObjectInfo{
 		"runs/old/artifacts/report.txt": {
 			ObjectMeta: jetstream.ObjectMeta{Name: "runs/old/artifacts/report.txt"},
 			ModTime:    now.Add(-2 * time.Hour),
@@ -231,47 +231,54 @@ func TestCleanupRuntimeArtifactsDeletesOnlyExpiredRuntimeArtifacts(t *testing.T)
 			ObjectMeta: jetstream.ObjectMeta{Name: "sdk-inputs/old/input.txt"},
 			ModTime:    now.Add(-2 * time.Hour),
 		},
+		"sdk-inputs/new/input.txt": {
+			ObjectMeta: jetstream.ObjectMeta{Name: "sdk-inputs/new/input.txt"},
+			ModTime:    now.Add(-5 * time.Minute),
+		},
 		"datasets/input.txt": {
 			ObjectMeta: jetstream.ObjectMeta{Name: "datasets/input.txt"},
 			ModTime:    now.Add(-2 * time.Hour),
 		},
 	}}
 
-	deleted, err := cleanupRuntimeArtifacts(context.Background(), store, now.Add(-time.Hour))
+	deleted, err := cleanupRuntimeObjects(context.Background(), store, now.Add(-time.Hour))
 	if err != nil {
-		t.Fatalf("cleanupRuntimeArtifacts returned error: %v", err)
+		t.Fatalf("cleanupRuntimeObjects returned error: %v", err)
 	}
-	if deleted != 1 {
-		t.Fatalf("deleted = %d, want 1", deleted)
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
 	}
 	if _, found := store.objects["runs/old/artifacts/report.txt"]; found {
 		t.Fatal("old runtime artifact still exists after cleanup")
 	}
-	for _, name := range []string{"runs/new/artifacts/report.txt", "sdk-inputs/old/input.txt", "datasets/input.txt"} {
+	if _, found := store.objects["sdk-inputs/old/input.txt"]; found {
+		t.Fatal("old SDK input still exists after cleanup")
+	}
+	for _, name := range []string{"runs/new/artifacts/report.txt", "sdk-inputs/new/input.txt", "datasets/input.txt"} {
 		if _, found := store.objects[name]; !found {
 			t.Fatalf("object %q was deleted, want retained", name)
 		}
 	}
 }
 
-func TestCleanupRuntimeArtifactsTreatsEmptyStoreAsNoop(t *testing.T) {
-	store := &fakeRuntimeArtifactStore{listErr: jetstream.ErrNoObjectsFound}
+func TestCleanupRuntimeObjectsTreatsEmptyStoreAsNoop(t *testing.T) {
+	store := &fakeRuntimeObjectStore{listErr: jetstream.ErrNoObjectsFound}
 
-	deleted, err := cleanupRuntimeArtifacts(context.Background(), store, time.Now())
+	deleted, err := cleanupRuntimeObjects(context.Background(), store, time.Now())
 	if err != nil {
-		t.Fatalf("cleanupRuntimeArtifacts returned error: %v", err)
+		t.Fatalf("cleanupRuntimeObjects returned error: %v", err)
 	}
 	if deleted != 0 {
 		t.Fatalf("deleted = %d, want 0", deleted)
 	}
 }
 
-type fakeRuntimeArtifactStore struct {
+type fakeRuntimeObjectStore struct {
 	objects map[string]*jetstream.ObjectInfo
 	listErr error
 }
 
-func (s *fakeRuntimeArtifactStore) List(context.Context, ...jetstream.ListObjectsOpt) ([]*jetstream.ObjectInfo, error) {
+func (s *fakeRuntimeObjectStore) List(context.Context, ...jetstream.ListObjectsOpt) ([]*jetstream.ObjectInfo, error) {
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -282,7 +289,7 @@ func (s *fakeRuntimeArtifactStore) List(context.Context, ...jetstream.ListObject
 	return objects, nil
 }
 
-func (s *fakeRuntimeArtifactStore) Delete(_ context.Context, name string) error {
+func (s *fakeRuntimeObjectStore) Delete(_ context.Context, name string) error {
 	if _, found := s.objects[name]; !found {
 		return jetstream.ErrObjectNotFound
 	}

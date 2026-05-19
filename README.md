@@ -139,12 +139,12 @@ The runtime binary and container entrypoint both read these environment variable
 | `NATS_RUNTIME_MAX_VCPUS` | `1` | `--max-vcpus` | Hard cap for requested vCPUs. |
 | `NATS_RUNTIME_EXEC_TIMEOUT` | `5s` | `--exec-timeout` | Default Python execution timeout. |
 | `NATS_RUNTIME_TRUNCATE_LOG_MIB` | `1` | `--truncate-log-mib` | Max stdout/stderr MiB returned in metadata headers. `0` disables truncation. |
-| `NATS_RUNTIME_ARTIFACT_TTL` | `24h` | `--artifact-ttl` | Max age for runtime artifact objects. `0s` disables runtime artifact cleanup. |
-| `NATS_RUNTIME_ARTIFACT_CLEANUP_INTERVAL` | `1h` | `--artifact-cleanup-interval` | How often the runtime checks for expired artifact objects that still exist. `0s` disables the checker. |
+| `NATS_RUNTIME_ARTIFACT_TTL` | `24h` | `--artifact-ttl` | Max age for runtime-owned Object Store objects. `0s` disables runtime object cleanup. |
+| `NATS_RUNTIME_ARTIFACT_CLEANUP_INTERVAL` | `1h` | `--artifact-cleanup-interval` | How often the runtime checks for expired runtime-owned objects that still exist. `0s` disables the checker. |
 
 Per-request fields such as `memory_mib`, `swap_mib`, `workspace_mib`, and `exec_timeout` override the startup defaults for that run.
 
-Runtime artifacts uploaded under `runs/<run_id>/artifacts/...` expire after `NATS_RUNTIME_ARTIFACT_TTL`. The runtime runs a periodic cleanup checker to delete expired runtime artifact objects if they are still present. The checker does not delete SDK inputs, user-provided datasets, or other objects outside the runtime artifact prefix. The NATS Object Store bucket itself does not use native bucket-wide TTL, because that would also expire non-artifact objects in the same bucket.
+Runtime artifacts uploaded under `runs/<run_id>/artifacts/...` and SDK temp inputs uploaded under `sdk-inputs/...` expire after `NATS_RUNTIME_ARTIFACT_TTL`. The runtime service runs a periodic cleanup checker to delete expired runtime-owned objects if they are still present. The SDK client does not delete or purge Object Store objects. The checker does not delete user-provided datasets or other objects outside the runtime-owned prefixes. The NATS Object Store bucket itself does not use native bucket-wide TTL, because that would also expire non-runtime objects in the same bucket.
 
 ## NATS Auth Subjects
 
@@ -201,6 +201,34 @@ The runtime service needs to publish to these reply, JetStream API, and Object S
 ```text
 _INBOX.>
 $JS.API.>
+$JS.API.CONSUMER.DELETE.OBJ_python-runtime-workspaces.>
+$JS.API.STREAM.PURGE.OBJ_python-runtime-workspaces
+$O.python-runtime-workspaces.C.>
+$O.python-runtime-workspaces.M.>
+```
+
+Clients that use the runtime service need to publish to these request, control, JetStream API, and Object Store subjects. The SDK client does not delete or purge Object Store artifacts; only the runtime service needs stream purge permission. `CONSUMER.DELETE` is used by NATS Object Store reads to clean up ephemeral ordered consumers, not artifact objects.
+
+```text
+python.run
+python.control.settings.get
+python.control.settings.set
+python.control.settings.delete
+python.control.settings.list
+python.control.workers.set
+python.control.workers.list
+$JS.API.STREAM.INFO.OBJ_python-runtime-workspaces
+$JS.API.STREAM.MSG.GET.OBJ_python-runtime-workspaces
+$JS.API.CONSUMER.CREATE.OBJ_python-runtime-workspaces
+$JS.API.CONSUMER.DELETE.OBJ_python-runtime-workspaces.>
+$O.python-runtime-workspaces.C.>
+$O.python-runtime-workspaces.M.>
+```
+
+Clients that use the runtime service need to subscribe to these reply and Object Store subjects:
+
+```text
+_INBOX.>
 $O.python-runtime-workspaces.C.>
 $O.python-runtime-workspaces.M.>
 ```

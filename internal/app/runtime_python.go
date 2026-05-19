@@ -172,7 +172,7 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		nc.Close()
 		return nil, err
 	}
-	startRuntimeArtifactCleanup(ctx, runtime.store, cfg.ArtifactTTL, cfg.CleanupInterval)
+	startRuntimeObjectCleanup(ctx, runtime.store, cfg.ArtifactTTL, cfg.CleanupInterval)
 	return &runtimePythonRegistration{conn: nc, service: srv, runtime: runtime}, nil
 }
 
@@ -456,17 +456,17 @@ func uploadRuntimeArtifacts(ctx context.Context, store jetstream.ObjectStore, ru
 	return artifacts, nil
 }
 
-type runtimeArtifactObjectStore interface {
+type runtimeObjectStore interface {
 	List(ctx context.Context, opts ...jetstream.ListObjectsOpt) ([]*jetstream.ObjectInfo, error)
 	Delete(ctx context.Context, name string) error
 }
 
-func startRuntimeArtifactCleanup(ctx context.Context, store runtimeArtifactObjectStore, ttl, interval time.Duration) {
+func startRuntimeObjectCleanup(ctx context.Context, store runtimeObjectStore, ttl, interval time.Duration) {
 	if store == nil || ttl <= 0 || interval <= 0 {
 		return
 	}
 	go func() {
-		runRuntimeArtifactCleanupCheck(ctx, store, ttl)
+		runRuntimeObjectCleanupCheck(ctx, store, ttl)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -474,46 +474,47 @@ func startRuntimeArtifactCleanup(ctx context.Context, store runtimeArtifactObjec
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				runRuntimeArtifactCleanupCheck(ctx, store, ttl)
+				runRuntimeObjectCleanupCheck(ctx, store, ttl)
 			}
 		}
 	}()
 }
 
-func runRuntimeArtifactCleanupCheck(ctx context.Context, store runtimeArtifactObjectStore, ttl time.Duration) {
-	deleted, err := cleanupRuntimeArtifacts(ctx, store, time.Now().Add(-ttl))
+func runRuntimeObjectCleanupCheck(ctx context.Context, store runtimeObjectStore, ttl time.Duration) {
+	deleted, err := cleanupRuntimeObjects(ctx, store, time.Now().Add(-ttl))
 	if err != nil {
-		log.Printf("runtime_artifact_cleanup result=error error=%q", err)
+		log.Printf("runtime_object_cleanup result=error error=%q", err)
 		return
 	}
 	if deleted > 0 {
-		log.Printf("runtime_artifact_cleanup result=success deleted=%d", deleted)
+		log.Printf("runtime_object_cleanup result=success deleted=%d", deleted)
 	}
 }
 
-func cleanupRuntimeArtifacts(ctx context.Context, store runtimeArtifactObjectStore, cutoff time.Time) (int, error) {
+func cleanupRuntimeObjects(ctx context.Context, store runtimeObjectStore, cutoff time.Time) (int, error) {
 	objects, err := store.List(ctx)
 	if errors.Is(err, jetstream.ErrNoObjectsFound) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("list runtime artifacts: %w", err)
+		return 0, fmt.Errorf("list runtime objects: %w", err)
 	}
 	deleted := 0
 	for _, object := range objects {
-		if object == nil || !isRuntimeArtifactObjectName(object.Name) || object.ModTime.After(cutoff) {
+		if object == nil || !isRuntimeOwnedObjectName(object.Name) || object.ModTime.After(cutoff) {
 			continue
 		}
 		if err := store.Delete(ctx, object.Name); err != nil && !errors.Is(err, jetstream.ErrObjectNotFound) {
-			return deleted, fmt.Errorf("delete runtime artifact %q: %w", object.Name, err)
+			return deleted, fmt.Errorf("delete runtime object %q: %w", object.Name, err)
 		}
 		deleted++
 	}
 	return deleted, nil
 }
 
-func isRuntimeArtifactObjectName(name string) bool {
-	return strings.HasPrefix(name, "runs/") && strings.Contains(name, "/artifacts/")
+func isRuntimeOwnedObjectName(name string) bool {
+	return strings.HasPrefix(name, "sdk-inputs/") ||
+		(strings.HasPrefix(name, "runs/") && strings.Contains(name, "/artifacts/"))
 }
 
 func cleanWorkspaceRelativePath(path string) (string, error) {

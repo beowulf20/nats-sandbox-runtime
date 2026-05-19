@@ -126,9 +126,6 @@ func TestRunUploadsInputsAndSendsRuntimeWireRequest(t *testing.T) {
 	if !strings.HasSuffix(store.puts[0], "/a.txt") || !strings.HasSuffix(store.puts[1], "/nested/b.txt") {
 		t.Fatalf("puts = %#v, want deterministic sorted input uploads", store.puts)
 	}
-	if !reflect.DeepEqual(store.deleted, store.puts) {
-		t.Fatalf("deleted = %#v, want cleanup of uploaded objects %#v", store.deleted, store.puts)
-	}
 }
 
 func TestRunDecodesLogsAndDownloadsArtifacts(t *testing.T) {
@@ -161,7 +158,7 @@ func TestRunDecodesLogsAndDownloadsArtifacts(t *testing.T) {
 	}
 }
 
-func TestRunReturnsMicroErrorsAndCleansUploadedInputs(t *testing.T) {
+func TestRunReturnsMicroErrorsWithoutDeletingUploadedInputs(t *testing.T) {
 	store := newFakeStore()
 	msg := &nats.Msg{Header: nats.Header{}}
 	msg.Header.Set(micro.ErrorCodeHeader, "500")
@@ -180,8 +177,11 @@ func TestRunReturnsMicroErrorsAndCleansUploadedInputs(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "python runtime error 500: boom") {
 		t.Fatalf("Run error = %v, want runtime error", err)
 	}
-	if len(store.puts) != 1 || len(store.deleted) != 1 || store.deleted[0] != store.puts[0] {
-		t.Fatalf("puts/deleted = %#v/%#v, want cleanup after runtime error", store.puts, store.deleted)
+	if len(store.puts) != 1 {
+		t.Fatalf("puts = %#v, want one uploaded input", store.puts)
+	}
+	if _, found := store.objects[store.puts[0]]; !found {
+		t.Fatalf("uploaded input %q was deleted by SDK client", store.puts[0])
 	}
 }
 
@@ -276,7 +276,6 @@ type fakeStore struct {
 	objects map[string][]byte
 	puts    []string
 	gets    []string
-	deleted []string
 }
 
 func newFakeStore() *fakeStore {
@@ -296,12 +295,6 @@ func (s *fakeStore) GetBytes(_ context.Context, name string, _ ...jetstream.GetO
 		return nil, fmt.Errorf("object %q not found", name)
 	}
 	return append([]byte(nil), data...), nil
-}
-
-func (s *fakeStore) Delete(_ context.Context, name string) error {
-	s.deleted = append(s.deleted, name)
-	delete(s.objects, name)
-	return nil
 }
 
 func newTestClient(cfg Config) *Client {

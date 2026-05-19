@@ -356,8 +356,8 @@ func addRuntimePythonFlags(cmd *cobra.Command, runtimeCfg *RuntimePythonConfig) 
 	cmd.Flags().StringVar(&runtimeCfg.StdoutHeader, "stdout-header", runtimeCfg.StdoutHeader, "response header used for base64 stdout metadata")
 	cmd.Flags().StringVar(&runtimeCfg.StderrHeader, "stderr-header", runtimeCfg.StderrHeader, "response header used for base64 stderr metadata")
 	cmd.Flags().Int64Var(&runtimeCfg.TruncateLogMiB, "truncate-log-mib", runtimeCfg.TruncateLogMiB, "maximum stdout/stderr MiB returned in response metadata; 0 disables truncation")
-	cmd.Flags().DurationVar(&runtimeCfg.ArtifactTTL, "artifact-ttl", runtimeCfg.ArtifactTTL, "maximum age for runtime artifact objects; 0 disables artifact cleanup")
-	cmd.Flags().DurationVar(&runtimeCfg.CleanupInterval, "artifact-cleanup-interval", runtimeCfg.CleanupInterval, "interval for runtime artifact cleanup checks; 0 disables the background checker")
+	cmd.Flags().DurationVar(&runtimeCfg.ArtifactTTL, "artifact-ttl", runtimeCfg.ArtifactTTL, "maximum age for runtime-owned Object Store objects; 0 disables runtime object cleanup")
+	cmd.Flags().DurationVar(&runtimeCfg.CleanupInterval, "artifact-cleanup-interval", runtimeCfg.CleanupInterval, "interval for runtime-owned Object Store cleanup checks; 0 disables the background checker")
 }
 
 func newTestCommand(runNATSDeploymentTest func(context.Context, NATSDeploymentTestConfig) error, runRuntimeREPL func(context.Context, RuntimeREPLConfig) error) *cobra.Command {
