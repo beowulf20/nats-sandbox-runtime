@@ -126,6 +126,7 @@ The runtime binary and container entrypoint both read these environment variable
 | `RUNTIME_API_WEB_DIR` | `/opt/nats-sandbox-runtime/web/build` | `--web-dir` | Built frontend directory served by `runtime api`. |
 | `NATS_URL` | `nats://nats:4222` | `--url` | NATS server URL. JetStream must be enabled. |
 | `NATS_TOKEN` | empty | `--token` | NATS authentication token. The runtime also reads this env var directly when `--token` is omitted. |
+| `NATS_TOKEN_FILE` | empty | none | File containing the NATS authentication token. Useful for Swarm/Portainer secrets and used only when `--token` and `NATS_TOKEN` are empty. |
 | `NATS_BUCKET` | `python-runtime-workspaces` | `--bucket` | Object Store bucket for input files and run artifacts. |
 | `NATS_RUNTIME_WORKERS` | `1` | `--workers` | Initial worker count. Each worker can run one request at a time. |
 | `NATS_RUNTIME_KERNEL` | packaged kernel | `--kernel` | Firecracker guest kernel path. |
@@ -154,7 +155,22 @@ nats-server -js --auth "$NATS_TOKEN"
 nats-sandbox-runtime runtime api --token "$NATS_TOKEN"
 ```
 
-In containers, prefer setting `NATS_TOKEN` as an environment variable. The entrypoint leaves it in the environment and the runtime reads it at connection time, instead of expanding the secret into process arguments.
+In containers, prefer setting `NATS_TOKEN` as an environment variable or `NATS_TOKEN_FILE` as a Swarm/Portainer secret path. The entrypoint leaves the token out of process arguments and the runtime reads it at connection time.
+
+For Swarm/Portainer, a token containing `$` is easiest to pass as a secret:
+
+```bash
+printf '%s' '$USR:AAABBB' | docker secret create nats_sandbox_runtime_token -
+```
+
+Then set:
+
+```yaml
+environment:
+  NATS_TOKEN_FILE: /run/secrets/nats_sandbox_runtime_token
+secrets:
+  - nats_sandbox_runtime_token
+```
 
 For user/account permissions, the runtime service needs to subscribe to these request and service-monitoring subjects:
 

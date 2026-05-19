@@ -5,6 +5,8 @@ version: "3.8"
 # Swarm nodes or replace NATS_SANDBOX_RUNTIME_IMAGE with that image name.
 # Label one KVM-capable node first:
 # docker node update --label-add kvm=true <node-name>
+# For token auth, create an external secret named nats_sandbox_runtime_token
+# with the exact token content, for example "$USR:AAABBB".
 
 services:
   nats:
@@ -38,7 +40,7 @@ services:
     environment:
       NATS_RUNTIME_MODE: api
       NATS_URL: nats://nats:4222
-      NATS_TOKEN: ${NATS_TOKEN:-change-me}
+      NATS_TOKEN_FILE: /run/secrets/nats_sandbox_runtime_token
       NATS_BUCKET: python-runtime-workspaces
       NATS_RUNTIME_WORKERS: "1"
       NATS_RUNTIME_MEMORY_MIB: "128"
@@ -59,6 +61,8 @@ services:
     volumes:
       - runtime-snapshots:/opt/nats-sandbox-runtime/firecracker-assets/python-snapshot
       - runtime-workspaces:/opt/nats-sandbox-runtime/tmp
+    secrets:
+      - nats_sandbox_runtime_token
     devices:
       - /dev/kvm:/dev/kvm
     privileged: true
@@ -83,3 +87,7 @@ volumes:
   nats-data:
   runtime-snapshots:
   runtime-workspaces:
+
+secrets:
+  nats_sandbox_runtime_token:
+    external: true

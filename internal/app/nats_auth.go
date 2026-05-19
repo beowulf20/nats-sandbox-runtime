@@ -2,6 +2,7 @@ package app
 
 import (
 	"os"
+	"strings"
 
 	"github.com/nats-io/nats.go"
 )
@@ -18,5 +19,14 @@ func natsConnectToken(token string) string {
 	if token != "" {
 		return token
 	}
-	return os.Getenv("NATS_TOKEN")
+	if value := os.Getenv("NATS_TOKEN"); value != "" {
+		return value
+	}
+	if path := os.Getenv("NATS_TOKEN_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	return ""
 }
