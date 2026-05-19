@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -10,7 +11,7 @@ import (
 )
 
 func main() {
-	cmd := app.NewRootCommandWithRuntimeAPI(func(cfg app.Config) error {
+	cmd := app.NewRootCommandWithRuntimeAPIAndTools(func(cfg app.Config) error {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer stop()
 
@@ -30,6 +31,22 @@ func main() {
 		defer stop()
 
 		return app.RunRuntimeAPI(ctx, cfg, os.Stdout)
+	}, func(ctx context.Context, cfg app.NATSDeploymentTestConfig) error {
+		ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+		defer stop()
+
+		return app.RunNATSDeploymentTest(ctx, cfg, os.Stdout)
+	}, func(ctx context.Context, cfg app.RuntimeREPLConfig) error {
+		ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+		defer stop()
+
+		if err := app.RunRuntimeREPL(ctx, cfg, os.Stdin, os.Stdout, os.Stderr); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+		return nil
 	})
 
 	if err := cmd.Execute(); err != nil {

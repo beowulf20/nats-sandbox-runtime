@@ -160,7 +160,7 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		nc.Close()
 		return nil, fmt.Errorf("add runtime service: %w", err)
 	}
-	if err := srv.AddEndpoint("run", micro.HandlerFunc(runtime.handleRun), micro.WithEndpointSubject(runtimePythonEndpointSubject)); err != nil {
+	if err := srv.AddEndpoint("run", logMicroRequest(runtimePythonEndpointSubject, runtime.handleRun), micro.WithEndpointSubject(runtimePythonEndpointSubject)); err != nil {
 		_ = srv.Stop()
 		nc.Close()
 		return nil, fmt.Errorf("add runtime endpoint: %w", err)
@@ -187,7 +187,7 @@ func registerRuntimePythonControlPlaneEndpoints(srv micro.Service, runtime *runt
 		{name: "control-workers-list", subject: runtimePythonControlWorkersListSubject, handler: runtime.handleControlWorkersList},
 	}
 	for _, endpoint := range endpoints {
-		if err := srv.AddEndpoint(endpoint.name, endpoint.handler, micro.WithEndpointSubject(endpoint.subject)); err != nil {
+		if err := srv.AddEndpoint(endpoint.name, logMicroRequest(endpoint.subject, endpoint.handler), micro.WithEndpointSubject(endpoint.subject)); err != nil {
 			return fmt.Errorf("add runtime endpoint %s: %w", endpoint.subject, err)
 		}
 	}
@@ -278,10 +278,14 @@ func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq
 	}
 	startMarker := "__NATS_SANDBOX_RUNTIME_STDOUT_START_" + sanitizeRunIDForMarker(runID) + "__"
 	endMarker := "__NATS_SANDBOX_RUNTIME_STDOUT_END_" + sanitizeRunIDForMarker(runID) + "__"
-	cfg, err := s.localPythonConfigForRun(worker, runReq, workDir, workspaceDir, workspaceImagePath, wrapRuntimePythonCode(code, startMarker, endMarker))
+	completionMarker := "__NATS_SANDBOX_RUNTIME_COMPLETE_" + sanitizeRunIDForMarker(runID) + "__"
+	cfg, err := s.localPythonConfigForRun(worker, runReq, workDir, workspaceDir, workspaceImagePath, wrapRuntimePythonCode(code, startMarker, endMarker, completionMarker))
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, err
 	}
+	cfg.CompletionMarker = completionMarker
+	cfg.KillAfterCompletion = true
+	cfg.SkipGuestWorkspaceSync = true
 	result, err := RunLocalPythonExec(ctx, cfg)
 	stdout := extractRuntimePythonStdout(result.Stdout, startMarker, endMarker)
 	if err != nil {
@@ -483,8 +487,13 @@ func truncateForMetadata(data []byte, limitMiB int64) ([]byte, bool) {
 	return data[:limit], true
 }
 
-func wrapRuntimePythonCode(code, startMarker, endMarker string) string {
-	return "print(" + strconv.Quote(startMarker) + ")\n" + code + "\nprint(" + strconv.Quote(endMarker) + ")\n"
+func wrapRuntimePythonCode(code, startMarker, endMarker, completionMarker string) string {
+	return "import subprocess as __nats_runtime_subprocess\n" +
+		"print(" + strconv.Quote(startMarker) + ")\n" +
+		code + "\n" +
+		"print(" + strconv.Quote(endMarker) + ")\n" +
+		"__nats_runtime_subprocess.run(['/usr/bin/sync'], check=False)\n" +
+		"print(" + strconv.Quote(completionMarker) + ")\n"
 }
 
 func extractRuntimePythonStdout(output []byte, startMarker, endMarker string) []byte {

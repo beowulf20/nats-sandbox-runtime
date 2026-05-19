@@ -20,7 +20,7 @@ const (
 	defaultLocalVCPUs       = 1
 	defaultMaxVCPUs         = 1
 	defaultExecTimeout      = 5 * time.Second
-	defaultSwapMiB          = 0
+	defaultSwapMiB          = 256
 	defaultParallelRuns     = 1
 	defaultWorkspaceMiB     = 16
 	defaultRuntimeBucket    = "python-runtime-workspaces"
@@ -35,23 +35,26 @@ type Config struct {
 }
 
 type LocalPythonConfig struct {
-	KernelPath         string
-	RootfsPath         string
-	FirecrackerPath    string
-	SnapshotDir        string
-	WorkspaceDir       string
-	WorkspaceImagePath string
-	InlineCommand      string
-	ExecFilePath       string
-	HideFirecrackerLog bool
-	MemoryMiB          int64
-	SwapMiB            int64
-	WorkspaceMiB       int64
-	VCPUs              int64
-	MaxVCPUs           int64
-	Runs               int
-	ParallelRuns       int
-	ExecTimeout        time.Duration
+	KernelPath             string
+	RootfsPath             string
+	FirecrackerPath        string
+	SnapshotDir            string
+	WorkspaceDir           string
+	WorkspaceImagePath     string
+	CompletionMarker       string
+	KillAfterCompletion    bool
+	SkipGuestWorkspaceSync bool
+	InlineCommand          string
+	ExecFilePath           string
+	HideFirecrackerLog     bool
+	MemoryMiB              int64
+	SwapMiB                int64
+	WorkspaceMiB           int64
+	VCPUs                  int64
+	MaxVCPUs               int64
+	Runs                   int
+	ParallelRuns           int
+	ExecTimeout            time.Duration
 }
 
 type RuntimePythonConfig struct {
@@ -78,7 +81,15 @@ func NewRootCommand(run func(Config) error, runLocalPython func(context.Context,
 	return NewRootCommandWithRuntimeAPI(run, runLocalPython, runtimeRunner, nil)
 }
 
-func NewRootCommandWithRuntimeAPI(run func(Config) error, runLocalPython func(context.Context, LocalPythonConfig) error, runRuntimePython func(context.Context, RuntimePythonConfig) error, runRuntimeAPI func(context.Context, RuntimeAPIConfig) error) *cobra.Command {
+func NewRootCommandWithRuntimeAPI(run func(Config) error, runLocalPython func(context.Context, LocalPythonConfig) error, runRuntimePython func(context.Context, RuntimePythonConfig) error, runRuntimeAPI func(context.Context, RuntimeAPIConfig) error, runNATSDeploymentTest ...func(context.Context, NATSDeploymentTestConfig) error) *cobra.Command {
+	var natsTestRunner func(context.Context, NATSDeploymentTestConfig) error
+	if len(runNATSDeploymentTest) > 0 {
+		natsTestRunner = runNATSDeploymentTest[0]
+	}
+	return NewRootCommandWithRuntimeAPIAndTools(run, runLocalPython, runRuntimePython, runRuntimeAPI, natsTestRunner, nil)
+}
+
+func NewRootCommandWithRuntimeAPIAndTools(run func(Config) error, runLocalPython func(context.Context, LocalPythonConfig) error, runRuntimePython func(context.Context, RuntimePythonConfig) error, runRuntimeAPI func(context.Context, RuntimeAPIConfig) error, runNATSDeploymentTest func(context.Context, NATSDeploymentTestConfig) error, runRuntimeREPL func(context.Context, RuntimeREPLConfig) error) *cobra.Command {
 	cfg := Config{
 		Instances: 1,
 		URL:       LocalNATSURL,
@@ -103,6 +114,7 @@ func NewRootCommandWithRuntimeAPI(run func(Config) error, runLocalPython func(co
 	cmd.Flags().IntVarP(&cfg.Instances, "instances", "i", cfg.Instances, "number of service instances to register")
 	cmd.AddCommand(newLocalCommand(runLocalPython))
 	cmd.AddCommand(newRuntimeCommand(runRuntimePython, runRuntimeAPI))
+	cmd.AddCommand(newTestCommand(runNATSDeploymentTest, runRuntimeREPL))
 
 	return cmd
 }
@@ -321,4 +333,62 @@ func addRuntimePythonFlags(cmd *cobra.Command, runtimeCfg *RuntimePythonConfig) 
 	cmd.Flags().StringVar(&runtimeCfg.StdoutHeader, "stdout-header", runtimeCfg.StdoutHeader, "response header used for base64 stdout metadata")
 	cmd.Flags().StringVar(&runtimeCfg.StderrHeader, "stderr-header", runtimeCfg.StderrHeader, "response header used for base64 stderr metadata")
 	cmd.Flags().Int64Var(&runtimeCfg.TruncateLogMiB, "truncate-log-mib", runtimeCfg.TruncateLogMiB, "maximum stdout/stderr MiB returned in response metadata; 0 disables truncation")
+}
+
+func newTestCommand(runNATSDeploymentTest func(context.Context, NATSDeploymentTestConfig) error, runRuntimeREPL func(context.Context, RuntimeREPLConfig) error) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "test",
+		Short: "Run deployment smoke tests",
+	}
+	cmd.AddCommand(newTestNATSCommand(runNATSDeploymentTest))
+	cmd.AddCommand(newTestREPLCommand(runRuntimeREPL))
+	return cmd
+}
+
+func newTestNATSCommand(runNATSDeploymentTest func(context.Context, NATSDeploymentTestConfig) error) *cobra.Command {
+	cfg := defaultNATSDeploymentTestConfig()
+
+	cmd := &cobra.Command{
+		Use:   "nats",
+		Short: "Connect to NATS and optionally request a deployment subject",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateNATSDeploymentTestConfig(cfg); err != nil {
+				return err
+			}
+			if runNATSDeploymentTest == nil {
+				return fmt.Errorf("nats deployment test runner is not configured")
+			}
+			return runNATSDeploymentTest(cmd.Context(), cfg)
+		},
+	}
+	cmd.Flags().StringVar(&cfg.URL, "url", cfg.URL, "NATS server URL")
+	cmd.Flags().StringVar(&cfg.Bucket, "bucket", cfg.Bucket, "NATS Object Store bucket to verify; empty skips bucket verification")
+	cmd.Flags().StringVar(&cfg.Subject, "subject", cfg.Subject, "optional NATS subject to request")
+	cmd.Flags().StringVar(&cfg.Payload, "payload", cfg.Payload, "request payload sent when --subject is set")
+	cmd.Flags().DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "connection and request timeout")
+	return cmd
+}
+
+func newTestREPLCommand(runRuntimeREPL func(context.Context, RuntimeREPLConfig) error) *cobra.Command {
+	cfg := defaultRuntimeREPLConfig()
+
+	cmd := &cobra.Command{
+		Use:   "repl",
+		Short: "Run a simple line-oriented Python runtime REPL over NATS",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateRuntimeREPLConfig(cfg); err != nil {
+				return err
+			}
+			if runRuntimeREPL == nil {
+				return fmt.Errorf("runtime repl runner is not configured")
+			}
+			return runRuntimeREPL(cmd.Context(), cfg)
+		},
+	}
+	cmd.Flags().StringVar(&cfg.URL, "url", cfg.URL, "NATS server URL")
+	cmd.Flags().DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "connection and per-request timeout")
+	cmd.Flags().Int64Var(&cfg.MemoryMiB, "memory-mib", cfg.MemoryMiB, "per-request guest memory override in MiB; 0 omits the field")
+	cmd.Flags().Int64Var(&cfg.WorkspaceMiB, "workspace-mib", cfg.WorkspaceMiB, "per-request workspace size override in MiB; 0 omits the field")
+	cmd.Flags().StringVar(&cfg.ExecTimeout, "exec-timeout", cfg.ExecTimeout, "per-request Python execution timeout; empty omits the field")
+	return cmd
 }

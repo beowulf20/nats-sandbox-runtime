@@ -9,7 +9,7 @@ case "${1:-}" in
 		shift
 		exec "${binary}" "$@"
 		;;
-	runtime|local|help|--help|-h)
+	runtime|local|test|help|--help|-h)
 		exec "${binary}" "$@"
 		;;
 	api|python)
@@ -26,7 +26,7 @@ common_args="
 	--rootfs ${NATS_RUNTIME_ROOTFS:-/opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4}
 	--firecracker ${NATS_RUNTIME_FIRECRACKER:-/usr/local/bin/firecracker}
 	--memory-mib ${NATS_RUNTIME_MEMORY_MIB:-128}
-	--swap-mib ${NATS_RUNTIME_SWAP_MIB:-0}
+	--swap-mib ${NATS_RUNTIME_SWAP_MIB:-256}
 	--workspace-mib ${NATS_RUNTIME_WORKSPACE_MIB:-16}
 	--vcpus ${NATS_RUNTIME_VCPUS:-1}
 	--max-vcpus ${NATS_RUNTIME_MAX_VCPUS:-1}

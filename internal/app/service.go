@@ -66,7 +66,7 @@ func registerInstance(url string, index int) (serviceInstance, error) {
 	}
 
 	group := srv.AddGroup("time")
-	if err := group.AddEndpoint("now", micro.HandlerFunc(handleTimestamp)); err != nil {
+	if err := group.AddEndpoint("now", logMicroRequest("time.now", handleTimestamp)); err != nil {
 		_ = srv.Stop()
 		nc.Close()
 		return serviceInstance{}, fmt.Errorf("add endpoint instance %d: %w", index, err)

@@ -229,7 +229,7 @@ func newRuntimeAPIHTTPHandler(controlPlane *RuntimeControlPlane, workerPool *Run
 	mux.HandleFunc("/api/settings", api.handleSettingsList)
 	mux.HandleFunc("/api/settings/", api.handleSetting)
 	mux.HandleFunc("/", api.handleStatic)
-	return mux
+	return logHTTPRequest(mux)
 }
 
 type runtimeAPIHTTPServer struct {

@@ -368,7 +368,7 @@ func TestLocalPythonPrepareSnapshotInputMakesWorkspaceTreeWritableByRunner(t *te
 }
 
 func TestLocalPythonExecInputRunsUserCodeUnprivileged(t *testing.T) {
-	got := localPythonExecInput("print('hello')\n", "/workspace/script.py")
+	got := localPythonExecInput("print('hello')\n", "/workspace/script.py", true)
 
 	if !containsAll(got, "os.setgid(65534)", "os.setuid(65534)", "os.chdir('/workspace')", "compile(") {
 		t.Fatalf("exec input = %q, want user code to run unprivileged from workspace", got)
@@ -406,10 +406,43 @@ func TestLocalPythonExecSourceReadsScriptFile(t *testing.T) {
 }
 
 func TestLocalPythonExecInputWrapsSourceAsCompiledScript(t *testing.T) {
-	got := localPythonExecInput("print('hello')\n", "script.py")
+	got := localPythonExecInput("print('hello')\n", "script.py", true)
 
 	if !containsAll(got, "import base64", "compile(", "script.py", "raise SystemExit") {
 		t.Fatalf("exec input = %q, want compiled script wrapper", got)
+	}
+}
+
+func TestLocalPythonExecInputCanSkipGuestSync(t *testing.T) {
+	got := localPythonExecInput("print('hello')\n", "script.py", false)
+
+	if strings.Contains(got, "/usr/bin/sync") {
+		t.Fatalf("exec input = %q, want no guest sync command", got)
+	}
+}
+
+func TestLocalPythonCompletionWriterDetectsMarker(t *testing.T) {
+	var stdout bytes.Buffer
+	writer := newLocalPythonCompletionWriter(&stdout, "DONE")
+
+	if _, err := writer.Write([]byte("hello\nDO")); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	select {
+	case <-writer.Done():
+		t.Fatal("Done closed before full marker")
+	default:
+	}
+	if _, err := writer.Write([]byte("NE\n")); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	select {
+	case <-writer.Done():
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for marker detection")
+	}
+	if stdout.String() != "hello\nDONE\n" {
+		t.Fatalf("stdout = %q, want copied writes", stdout.String())
 	}
 }
 
@@ -578,6 +611,21 @@ func TestLocalPythonFirecrackerStderrCanHideFirecrackerLog(t *testing.T) {
 
 	if got := stderr.String(); got != "" {
 		t.Fatalf("stderr = %q, want hidden firecracker log", got)
+	}
+}
+
+func TestWriteLocalPythonFirecrackerLogCopiesNonEmptyLog(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "firecracker.log")
+	if err := os.WriteFile(logPath, []byte("fatal runtime detail\n"), 0o644); err != nil {
+		t.Fatalf("write log returned error: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	writeLocalPythonFirecrackerLog(&stderr, logPath)
+
+	if got := stderr.String(); !containsAll(got, "firecracker log:", "fatal runtime detail") {
+		t.Fatalf("stderr = %q, want firecracker log contents", got)
 	}
 }
 

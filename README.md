@@ -38,6 +38,8 @@ docker build -t nats-sandbox-runtime:local .
 
 The build downloads the Firecracker release binary and Firecracker CI guest assets, then patches the guest rootfs with this repo's Python init script. It does not require a local `firecracker-assets/` directory.
 
+Python modules available inside the Firecracker guest are declared in the repo-root `requirements.txt`; the Docker build installs those requirements into the packaged guest rootfs.
+
 The image defaults to `runtime api`, listens on `0.0.0.0:8080`, and expects a NATS server named `nats` with JetStream enabled.
 
 ```bash
@@ -73,6 +75,46 @@ docker run --rm --device=/dev/kvm --privileged nats-sandbox-runtime:local \
   --workers 2
 ```
 
+## Deployment Smoke Test
+
+Use the built-in test command from a host or container that can reach NATS:
+
+```bash
+nats-sandbox-runtime test nats \
+  --url nats://localhost:4222 \
+  --bucket python-runtime-workspaces
+```
+
+To also verify that a deployed runtime service is answering NATS requests, request a lightweight control subject:
+
+```bash
+nats-sandbox-runtime test nats \
+  --url nats://localhost:4222 \
+  --bucket python-runtime-workspaces \
+  --subject python.control.settings.list \
+  --payload '{}'
+```
+
+## Runtime REPL Test
+
+Use `test repl` for a simple line-oriented Python prompt against a running runtime service:
+
+```bash
+nats-sandbox-runtime test repl --url nats://localhost:4222
+```
+
+Each non-empty line is sent as a separate `python.run` request without `thread_id`, so no workspace persistence is requested. Use `exit`, `quit`, or `.exit` to end the session.
+
+For a low-resource smoke test, pass per-request overrides:
+
+```bash
+nats-sandbox-runtime test repl \
+  --url nats://localhost:4222 \
+  --memory-mib 64 \
+  --workspace-mib 8 \
+  --exec-timeout 2s
+```
+
 ## Runtime Configuration
 
 The container entrypoint maps environment variables to CLI flags. Extra arguments passed to `docker run` are appended last, so explicit flags can override the environment.
@@ -89,7 +131,7 @@ The container entrypoint maps environment variables to CLI flags. Extra argument
 | `NATS_RUNTIME_ROOTFS` | packaged rootfs | `--rootfs` | Firecracker guest root filesystem path. |
 | `NATS_RUNTIME_FIRECRACKER` | `/usr/local/bin/firecracker` | `--firecracker` | Firecracker binary path. |
 | `NATS_RUNTIME_MEMORY_MIB` | `128` | `--memory-mib` | Default guest memory per run. |
-| `NATS_RUNTIME_SWAP_MIB` | `0` | `--swap-mib` | Default dedicated guest swap size. |
+| `NATS_RUNTIME_SWAP_MIB` | `256` | `--swap-mib` | Default dedicated guest swap size. |
 | `NATS_RUNTIME_WORKSPACE_MIB` | `16` | `--workspace-mib` | Default writable `/workspace` ext4 size. |
 | `NATS_RUNTIME_VCPUS` | `1` | `--vcpus` | Guest vCPU count. |
 | `NATS_RUNTIME_MAX_VCPUS` | `1` | `--max-vcpus` | Hard cap for requested vCPUs. |

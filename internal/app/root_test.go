@@ -1,9 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 func TestRootCommandDefaultsToOneLocalInstance(t *testing.T) {
@@ -88,8 +92,8 @@ func TestLocalPythonCommandUsesDefaultAssetsAndInteractivePython(t *testing.T) {
 	if got.MemoryMiB != 128 {
 		t.Fatalf("MemoryMiB = %d, want 128", got.MemoryMiB)
 	}
-	if got.SwapMiB != 0 {
-		t.Fatalf("SwapMiB = %d, want 0", got.SwapMiB)
+	if got.SwapMiB != 256 {
+		t.Fatalf("SwapMiB = %d, want 256", got.SwapMiB)
 	}
 	if got.WorkspaceMiB != 16 {
 		t.Fatalf("WorkspaceMiB = %d, want 16", got.WorkspaceMiB)
@@ -237,6 +241,146 @@ func TestRuntimeAPICommandRejectsInvalidConfig(t *testing.T) {
 		if err := cmd.Execute(); err == nil {
 			t.Fatalf("Execute(%v) returned nil, want error", args)
 		}
+	}
+}
+
+func TestNATSDeploymentTestCommandAcceptsConfig(t *testing.T) {
+	var got NATSDeploymentTestConfig
+	cmd := NewRootCommandWithRuntimeAPI(nil, nil, nil, nil, func(ctx context.Context, cfg NATSDeploymentTestConfig) error {
+		got = cfg
+		return nil
+	})
+	cmd.SetArgs([]string{"test", "nats", "--url", "nats://demo:4222", "--bucket", "PY", "--subject", "python.control.settings.list", "--payload", "{}", "--timeout", "3s"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if got.URL != "nats://demo:4222" {
+		t.Fatalf("URL = %q, want override", got.URL)
+	}
+	if got.Bucket != "PY" {
+		t.Fatalf("Bucket = %q, want override", got.Bucket)
+	}
+	if got.Subject != "python.control.settings.list" {
+		t.Fatalf("Subject = %q, want control subject", got.Subject)
+	}
+	if got.Payload != "{}" {
+		t.Fatalf("Payload = %q, want JSON object", got.Payload)
+	}
+	if got.Timeout != 3*time.Second {
+		t.Fatalf("Timeout = %s, want 3s", got.Timeout)
+	}
+}
+
+func TestNATSDeploymentTestCommandRejectsInvalidConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"test", "nats", "--url", ""},
+		{"test", "nats", "--timeout", "0s"},
+		{"test", "nats", "--subject", "", "--payload", "{}"},
+	} {
+		cmd := NewRootCommandWithRuntimeAPI(nil, nil, nil, nil, func(ctx context.Context, cfg NATSDeploymentTestConfig) error {
+			t.Fatalf("runner should not be called for invalid config")
+			return nil
+		})
+		cmd.SetArgs(args)
+
+		if err := cmd.Execute(); err == nil {
+			t.Fatalf("Execute(%v) returned nil, want error", args)
+		}
+	}
+}
+
+func TestRuntimeREPLCommandAcceptsConfig(t *testing.T) {
+	var got RuntimeREPLConfig
+	cmd := NewRootCommandWithRuntimeAPIAndTools(nil, nil, nil, nil, nil, func(ctx context.Context, cfg RuntimeREPLConfig) error {
+		got = cfg
+		return nil
+	})
+	cmd.SetArgs([]string{"test", "repl", "--url", "nats://demo:4222", "--timeout", "3s", "--memory-mib", "256", "--workspace-mib", "32", "--exec-timeout", "10s"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if got.URL != "nats://demo:4222" {
+		t.Fatalf("URL = %q, want override", got.URL)
+	}
+	if got.Timeout != 3*time.Second {
+		t.Fatalf("Timeout = %s, want 3s", got.Timeout)
+	}
+	if got.MemoryMiB != 256 {
+		t.Fatalf("MemoryMiB = %d, want 256", got.MemoryMiB)
+	}
+	if got.WorkspaceMiB != 32 {
+		t.Fatalf("WorkspaceMiB = %d, want 32", got.WorkspaceMiB)
+	}
+	if got.ExecTimeout != "10s" {
+		t.Fatalf("ExecTimeout = %q, want 10s", got.ExecTimeout)
+	}
+}
+
+func TestRuntimeREPLCommandUsesDefaults(t *testing.T) {
+	var got RuntimeREPLConfig
+	cmd := NewRootCommandWithRuntimeAPIAndTools(nil, nil, nil, nil, nil, func(ctx context.Context, cfg RuntimeREPLConfig) error {
+		got = cfg
+		return nil
+	})
+	cmd.SetArgs([]string{"test", "repl"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if got.URL != LocalNATSURL {
+		t.Fatalf("URL = %q, want %q", got.URL, LocalNATSURL)
+	}
+	if got.Timeout != 30*time.Second {
+		t.Fatalf("Timeout = %s, want 30s", got.Timeout)
+	}
+	if got.MemoryMiB != 0 {
+		t.Fatalf("MemoryMiB = %d, want 0", got.MemoryMiB)
+	}
+	if got.WorkspaceMiB != 0 {
+		t.Fatalf("WorkspaceMiB = %d, want 0", got.WorkspaceMiB)
+	}
+	if got.ExecTimeout != "" {
+		t.Fatalf("ExecTimeout = %q, want empty", got.ExecTimeout)
+	}
+}
+
+func TestRuntimeREPLCommandRejectsInvalidConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"test", "repl", "--url", ""},
+		{"test", "repl", "--timeout", "0s"},
+		{"test", "repl", "--memory-mib", "-1"},
+		{"test", "repl", "--workspace-mib", "-1"},
+		{"test", "repl", "--exec-timeout", "bogus"},
+		{"test", "repl", "--exec-timeout", "0s"},
+	} {
+		cmd := NewRootCommandWithRuntimeAPIAndTools(nil, nil, nil, nil, nil, func(ctx context.Context, cfg RuntimeREPLConfig) error {
+			t.Fatalf("runner should not be called for invalid config")
+			return nil
+		})
+		cmd.SetArgs(args)
+
+		if err := cmd.Execute(); err == nil {
+			t.Fatalf("Execute(%v) returned nil, want error", args)
+		}
+	}
+}
+
+func TestWriteNATSDeploymentRuntimeLogHeadersDecodesRuntimeLogs(t *testing.T) {
+	headers := nats.Header{}
+	headers.Set("Nats-Sandbox-Runtime-Python-Stdout-B64", base64.StdEncoding.EncodeToString([]byte("hello\n")))
+	headers.Set("Nats-Sandbox-Runtime-Python-Stderr-B64", base64.StdEncoding.EncodeToString([]byte("firecracker detail\n")))
+	headers.Set("Nats-Sandbox-Runtime-Python-Stderr-B64-Truncated", "true")
+
+	var out bytes.Buffer
+	writeNATSDeploymentRuntimeLogHeaders(&out, headers)
+
+	if got := out.String(); !containsAll(got, "python_stdout:", "hello", "python_stderr:", "firecracker detail", "python_stderr_truncated: true") {
+		t.Fatalf("output = %q, want decoded runtime logs", got)
 	}
 }
 

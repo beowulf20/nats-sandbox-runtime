@@ -213,6 +213,7 @@ func TestRuntimeAPIHTTPSnapshotHandlers(t *testing.T) {
 	paths := localPythonSnapshotPaths(worker.SnapshotDir)
 	writeRuntimeAPITestFile(t, paths.StatePath, "state")
 	writeRuntimeAPITestFile(t, paths.MemoryPath, "memory")
+	writeRuntimeAPITestSparseFile(t, paths.SwapPath, cfg.LocalPython.SwapMiB*1024*1024)
 	writeRuntimeAPITestFile(t, paths.VersionPath, localPythonSnapshotVersion(cfg.LocalPython)+"\n")
 	writeRuntimeAPITestFile(t, paths.WorkspacePath, "workspace")
 
@@ -448,6 +449,24 @@ func writeRuntimeAPITestFile(t *testing.T, path string, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile %s returned error: %v", path, err)
+	}
+}
+
+func writeRuntimeAPITestSparseFile(t *testing.T, path string, size int64) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll %s returned error: %v", filepath.Dir(path), err)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("Create %s returned error: %v", path, err)
+	}
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		t.Fatalf("Truncate %s returned error: %v", path, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close %s returned error: %v", path, err)
 	}
 }
 

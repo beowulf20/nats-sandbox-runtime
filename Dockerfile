@@ -29,6 +29,7 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/*
 
 COPY scripts/fc-python-init.py /tmp/fc-python-init
+COPY requirements.txt /tmp/guest-requirements.txt
 RUN set -eu; \
 	case "${TARGETARCH}" in \
 		amd64) fc_arch="x86_64" ;; \
@@ -52,7 +53,26 @@ RUN set -eu; \
 	mkdir -p /out /tmp/rootfs; \
 	curl -fsSL "${bucket}/${kernel}" -o /out/vmlinux.bin; \
 	curl -fsSL "${bucket}/${rootfs}" -o /tmp/rootfs.squashfs; \
-	unsquashfs -q -d /tmp/rootfs /tmp/rootfs.squashfs; \
+	unsquashfs -q -d /tmp/rootfs /tmp/rootfs.squashfs
+
+RUN set -eu; \
+	if [ -s /tmp/guest-requirements.txt ]; then \
+		mkdir -p /tmp/rootfs/dev /tmp/rootfs/etc /tmp/rootfs/tmp /tmp/rootfs/var/cache/apt/archives/partial /tmp/rootfs/var/log/apt; \
+		[ -e /tmp/rootfs/dev/null ] || mknod -m 0666 /tmp/rootfs/dev/null c 1 3; \
+		[ -e /tmp/rootfs/dev/zero ] || mknod -m 0666 /tmp/rootfs/dev/zero c 1 5; \
+		[ -e /tmp/rootfs/dev/random ] || mknod -m 0666 /tmp/rootfs/dev/random c 1 8; \
+		[ -e /tmp/rootfs/dev/urandom ] || mknod -m 0666 /tmp/rootfs/dev/urandom c 1 9; \
+		chmod 1777 /tmp/rootfs/tmp; \
+		cp /etc/resolv.conf /tmp/rootfs/etc/resolv.conf; \
+		install -m 0644 /tmp/guest-requirements.txt /tmp/rootfs/tmp/requirements.txt; \
+		chroot /tmp/rootfs /usr/bin/apt-get update; \
+		chroot /tmp/rootfs /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --no-install-recommends python3-pip; \
+		chroot /tmp/rootfs /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir -r /tmp/requirements.txt; \
+		chroot /tmp/rootfs /usr/bin/apt-get clean; \
+		rm -rf /tmp/rootfs/tmp/requirements.txt /tmp/rootfs/root/.cache /tmp/rootfs/var/lib/apt/lists/* /tmp/rootfs/etc/resolv.conf; \
+	fi
+
+RUN set -eu; \
 	install -m 0755 /tmp/fc-python-init /tmp/rootfs/usr/local/bin/fc-python-init; \
 	truncate -s "${GUEST_ROOTFS_SIZE}" /out/rootfs.ext4; \
 	mkfs.ext4 -q -d /tmp/rootfs /out/rootfs.ext4; \

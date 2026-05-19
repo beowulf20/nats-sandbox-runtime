@@ -207,9 +207,9 @@ func TestExtractRuntimePythonStdoutUsesServiceMarkers(t *testing.T) {
 }
 
 func TestWrapRuntimePythonCodeAddsMarkers(t *testing.T) {
-	got := wrapRuntimePythonCode("print(42)", "START", "END")
+	got := wrapRuntimePythonCode("print(42)", "START", "END", "COMPLETE")
 
-	if !containsAll(got, `print("START")`, "print(42)", `print("END")`) {
-		t.Fatalf("wrapped code = %q, want start marker, code, end marker", got)
+	if !containsAll(got, `print("START")`, "print(42)", `print("END")`, "/usr/bin/sync", `print("COMPLETE")`) {
+		t.Fatalf("wrapped code = %q, want start, end, sync, and completion markers", got)
 	}
 }

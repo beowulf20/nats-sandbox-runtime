@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -152,14 +153,14 @@ func RunLocalPythonExec(ctx context.Context, cfg LocalPythonConfig) (LocalPython
 	}
 	paths := localPythonSnapshotPathsForConfig(cfg)
 	if err := ensureLocalPythonWorkspaceImage(ctx, cfg, paths); err != nil {
-		return LocalPythonExecResult{}, err
+		return LocalPythonExecResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 	}
 	if err := ensureLocalPythonSnapshot(ctx, cfg, paths, &stderr); err != nil {
-		return LocalPythonExecResult{}, err
+		return LocalPythonExecResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 	}
 	elapsed, err := runLocalPythonSnapshotOnce(ctx, cfg, paths, nil, &stdout, &stderr)
 	if err != nil {
-		return LocalPythonExecResult{}, err
+		return LocalPythonExecResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 	}
 	return LocalPythonExecResult{
 		Elapsed: elapsed,
@@ -355,6 +356,78 @@ func runLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths lo
 	return err
 }
 
+type localPythonCompletionWriter struct {
+	out    io.Writer
+	marker string
+	done   chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	buf    bytes.Buffer
+}
+
+func newLocalPythonCompletionWriter(out io.Writer, marker string) *localPythonCompletionWriter {
+	return &localPythonCompletionWriter{
+		out:    out,
+		marker: marker,
+		done:   make(chan struct{}),
+	}
+}
+
+func (w *localPythonCompletionWriter) Write(p []byte) (int, error) {
+	n, err := w.out.Write(p)
+	w.mu.Lock()
+	_, _ = w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.marker) {
+		w.once.Do(func() { close(w.done) })
+	}
+	w.mu.Unlock()
+	return n, err
+}
+
+func (w *localPythonCompletionWriter) Done() <-chan struct{} {
+	return w.done
+}
+
+func localPythonCompletionStdout(cfg LocalPythonConfig, stdout io.Writer) (*localPythonCompletionWriter, chan struct{}, error) {
+	if cfg.CompletionMarker == "" || !cfg.KillAfterCompletion {
+		return nil, nil, nil
+	}
+	if stdout == nil {
+		return nil, nil, fmt.Errorf("completion marker requires stdout")
+	}
+	return newLocalPythonCompletionWriter(stdout, cfg.CompletionMarker), make(chan struct{}), nil
+}
+
+func waitForLocalPythonSnapshotCompletion(ctx context.Context, cfg LocalPythonConfig, cmd *exec.Cmd, completionWriter *localPythonCompletionWriter, stdoutDone <-chan struct{}) error {
+	if completionWriter == nil || !cfg.KillAfterCompletion {
+		return cmd.Wait()
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+	var killedAfterCompletion bool
+	var err error
+	select {
+	case <-completionWriter.Done():
+		killedAfterCompletion = true
+		_ = cmd.Process.Kill()
+		err = <-waitDone
+	case err = <-waitDone:
+	case <-ctx.Done():
+		_ = cmd.Process.Kill()
+		<-waitDone
+		err = ctx.Err()
+	}
+	if stdoutDone != nil {
+		<-stdoutDone
+	}
+	if killedAfterCompletion && localPythonProcessWasKilled(err) {
+		return nil
+	}
+	return err
+}
+
 func runLocalPythonSnapshotOnce(ctx context.Context, cfg LocalPythonConfig, paths localPythonSnapshotFiles, stdin io.Reader, stdout, stderr io.Writer) (time.Duration, error) {
 	execSource, err := localPythonExecSource(cfg)
 	if err != nil {
@@ -368,7 +441,8 @@ func runLocalPythonSnapshotOnce(ctx context.Context, cfg LocalPythonConfig, path
 
 	startedAt := time.Now()
 	apiSock := filepath.Join(workDir, "firecracker.socket")
-	cmd := exec.CommandContext(ctx, localPythonFirecrackerBinary(cfg), "--api-sock", apiSock, "--log-path", filepath.Join(workDir, "firecracker.log"))
+	logPath := filepath.Join(workDir, "firecracker.log")
+	cmd := exec.CommandContext(ctx, localPythonFirecrackerBinary(cfg), "--api-sock", apiSock, "--log-path", logPath)
 	extraFiles, closeExtraFiles, err := localPythonFirecrackerExtraFiles(cfg, paths.WorkspacePath, paths.SwapPath)
 	if err != nil {
 		return 0, err
@@ -376,10 +450,31 @@ func runLocalPythonSnapshotOnce(ctx context.Context, cfg LocalPythonConfig, path
 	defer closeExtraFiles()
 	cmd.ExtraFiles = extraFiles
 	cmd.Stdin = localPythonSnapshotStdin(cfg, execSource, stdin)
-	cmd.Stdout = stdout
+	completionWriter, stdoutDone, err := localPythonCompletionStdout(cfg, stdout)
+	if err != nil {
+		return 0, err
+	}
+	if completionWriter == nil {
+		cmd.Stdout = stdout
+	} else {
+		cmd.Stdout = nil
+	}
 	cmd.Stderr = localPythonFirecrackerStderr(cfg, stderr)
+	var stdoutPipe io.ReadCloser
+	if completionWriter != nil {
+		stdoutPipe, err = cmd.StdoutPipe()
+		if err != nil {
+			return 0, fmt.Errorf("create stdout pipe: %w", err)
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("start firecracker: %w", err)
+	}
+	if stdoutPipe != nil {
+		go func() {
+			_, _ = io.Copy(completionWriter, stdoutPipe)
+			close(stdoutDone)
+		}()
 	}
 	if err := waitForUnixSocket(ctx, apiSock, 5*time.Second); err != nil {
 		_ = cmd.Process.Kill()
@@ -400,13 +495,14 @@ func runLocalPythonSnapshotOnce(ctx context.Context, cfg LocalPythonConfig, path
 		_ = cmd.Wait()
 		return 0, fmt.Errorf("load snapshot: %w", err)
 	}
-	err = cmd.Wait()
+	err = waitForLocalPythonSnapshotCompletion(ctx, cfg, cmd, completionWriter, stdoutDone)
 	elapsed := time.Since(restoreStartedAt)
 	if !cfg.HideFirecrackerLog {
 		fmt.Fprintf(stderr, "firecracker snapshot run completed after %s\n", time.Since(startedAt).Round(time.Millisecond))
 	}
 	if err != nil {
-		return 0, fmt.Errorf("run firecracker snapshot: %w", err)
+		writeLocalPythonFirecrackerLog(stderr, logPath)
+		return 0, fmt.Errorf("run firecracker snapshot: %w%s", err, localPythonProcessKilledHint(err))
 	}
 	if err := syncLocalPythonWorkspaceImage(ctx, cfg, paths); err != nil {
 		return 0, err
@@ -589,7 +685,7 @@ func runLocalPythonBenchmarkOnce(ctx context.Context, cfg LocalPythonConfig, pat
 	}
 	defer closeExtraFiles()
 	cmd.ExtraFiles = extraFiles
-	cmd.Stdin = strings.NewReader(localPythonExecInput(execSource+"\nprint("+strconv.Quote(marker)+")\n", localPythonExecFilename(cfg)))
+	cmd.Stdin = strings.NewReader(localPythonExecInput(execSource+"\nprint("+strconv.Quote(marker)+")\n", localPythonExecFilename(cfg), true))
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return localPythonBenchmarkRun{}, fmt.Errorf("create benchmark stdout pipe: %w", err)
@@ -657,7 +753,7 @@ func localPythonSnapshotStdin(cfg LocalPythonConfig, execSource string, stdin io
 	if execSource == "" {
 		return stdin
 	}
-	return strings.NewReader(localPythonExecInput(execSource, localPythonExecFilename(cfg)))
+	return strings.NewReader(localPythonExecInput(execSource, localPythonExecFilename(cfg), !cfg.SkipGuestWorkspaceSync))
 }
 
 func localPythonExecSource(cfg LocalPythonConfig) (string, error) {
@@ -681,9 +777,9 @@ func localPythonExecFilename(cfg LocalPythonConfig) string {
 	return "<exec>"
 }
 
-func localPythonExecInput(source, filename string) string {
+func localPythonExecInput(source, filename string, syncWorkspace bool) string {
 	encoded := base64.StdEncoding.EncodeToString([]byte(source))
-	return "import base64, os, subprocess\n" +
+	input := "import base64, os, subprocess\n" +
 		"os.environ['HOME'] = '/workspace'\n" +
 		"os.environ['TMPDIR'] = '/workspace'\n" +
 		"os.chdir('/workspace')\n" +
@@ -693,10 +789,14 @@ func localPythonExecInput(source, filename string) string {
 		"    os.setgid(65534)\n" +
 		"    os.setuid(65534)\n" +
 		"    exec(compile(__nats_code, " + strconv.Quote(filename) + ", 'exec'), {'__name__': '__main__', '__file__': " + strconv.Quote(filename) + "})\n" +
-		"finally:\n" +
-		"    subprocess.run(['/usr/bin/sync'], check=False)\n" +
-		"\n" +
-		"raise SystemExit\n"
+		"finally:\n"
+	if syncWorkspace {
+		input += "    subprocess.run(['/usr/bin/sync'], check=False)\n"
+	} else {
+		input += "    pass\n"
+	}
+	input += "\nraise SystemExit\n"
+	return input
 }
 
 func localPythonPrepareSnapshotInput(cfg LocalPythonConfig) string {
@@ -1020,6 +1120,33 @@ func localPythonFirecrackerStderr(cfg LocalPythonConfig, stderr io.Writer) io.Wr
 		return io.Discard
 	}
 	return stderr
+}
+
+func writeLocalPythonFirecrackerLog(stderr io.Writer, logPath string) {
+	data, err := os.ReadFile(logPath)
+	if err != nil || strings.TrimSpace(string(data)) == "" {
+		return
+	}
+	fmt.Fprintf(stderr, "firecracker log:\n%s\n", data)
+}
+
+func localPythonProcessKilledHint(err error) string {
+	if !localPythonProcessWasKilled(err) {
+		return ""
+	}
+	return " (process received SIGKILL; check host/container memory limits, cgroup OOM events, and Firecracker/KVM runtime limits)"
+}
+
+func localPythonProcessWasKilled(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+		return false
+	}
+	return true
 }
 
 func checkKVMDevice(path string) error {
