@@ -255,6 +255,26 @@ func TestRunEnforcesOutputLimitOnDownloadedBytes(t *testing.T) {
 	}
 }
 
+func TestRunExplainsObjectStoreConsumerDeletePermissionError(t *testing.T) {
+	store := newFakeStore()
+	store.getErr = errors.New(`nats: permissions violation: Permissions Violation for Publish to "$JS.API.CONSUMER.DELETE.OBJ_python-runtime-workspaces.bHINEdZ2"`)
+	client := &Client{
+		req: &fakeRequester{response: runtimeResponse("run-a", []pythonRunArtifact{
+			{Path: "out.txt", Object: "runs/run-a/artifacts/out.txt", Size: 1},
+		})},
+		store: store,
+		cfg:   withDefaults(Config{}),
+	}
+
+	_, err := client.Run(t.Context(), Request{ThreadID: "thread-a", Code: "print(1)"})
+	if err == nil {
+		t.Fatal("Run returned nil, want permission error")
+	}
+	if !strings.Contains(err.Error(), `$JS.API.CONSUMER.DELETE.OBJ_python-runtime-workspaces.>`) {
+		t.Fatalf("Run error = %v, want consumer delete permission hint", err)
+	}
+}
+
 type fakeRequester struct {
 	response *nats.Msg
 	handle   func(subject string, data []byte) *nats.Msg
@@ -276,6 +296,7 @@ type fakeStore struct {
 	objects map[string][]byte
 	puts    []string
 	gets    []string
+	getErr  error
 }
 
 func newFakeStore() *fakeStore {
@@ -290,6 +311,9 @@ func (s *fakeStore) PutBytes(_ context.Context, name string, data []byte) (*jets
 
 func (s *fakeStore) GetBytes(_ context.Context, name string, _ ...jetstream.GetObjectOpt) ([]byte, error) {
 	s.gets = append(s.gets, name)
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
 	data, ok := s.objects[name]
 	if !ok {
 		return nil, fmt.Errorf("object %q not found", name)

@@ -207,7 +207,7 @@ $O.python-runtime-workspaces.C.>
 $O.python-runtime-workspaces.M.>
 ```
 
-Clients that use the runtime service need to publish to these request, control, JetStream API, and Object Store subjects. The SDK client does not delete or purge Object Store artifacts; only the runtime service needs stream purge permission. `CONSUMER.DELETE` is used by NATS Object Store reads to clean up ephemeral ordered consumers, not artifact objects.
+Clients that use the runtime service need to publish to these request, control, JetStream API, and Object Store subjects. The SDK client does not delete or purge Object Store artifacts; only the runtime service needs stream purge permission. `CONSUMER.DELETE` is still required because NATS Object Store reads create ephemeral ordered consumers and publish to `CONSUMER.DELETE` to clean them up after downloading artifacts.
 
 ```text
 python.run
@@ -233,7 +233,11 @@ $O.python-runtime-workspaces.C.>
 $O.python-runtime-workspaces.M.>
 ```
 
-Replace `python-runtime-workspaces` in the `$O...` subjects when `NATS_BUCKET` is changed.
+Replace `python-runtime-workspaces` in the `$JS.API...OBJ_python-runtime-workspaces...` and `$O...` subjects when `NATS_BUCKET` is changed. If an SDK run fails with a permission error like `Publish to "$JS.API.CONSUMER.DELETE.OBJ_python-runtime-workspaces.<consumer>"`, the client publish allow-list is missing:
+
+```text
+$JS.API.CONSUMER.DELETE.OBJ_python-runtime-workspaces.>
+```
 
 ## Scaling Warning
 
@@ -321,7 +325,7 @@ Stdout and stderr are returned as base64 NATS headers:
 
 ## Go SDK V0
 
-The `pkg/pyruntime` SDK wraps the byte-only V0 flow for Go callers. It uploads input bytes to the runtime Object Store bucket, calls `python.run`, downloads every returned workspace artifact into memory, and best-effort deletes only the temporary SDK input objects.
+The `pkg/pyruntime` SDK wraps the byte-only V0 flow for Go callers. It uploads input bytes to the runtime Object Store bucket, calls `python.run`, and downloads every returned workspace artifact into memory.
 
 ```go
 package main

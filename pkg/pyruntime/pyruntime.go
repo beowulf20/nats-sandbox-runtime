@@ -309,7 +309,7 @@ func downloadArtifacts(ctx context.Context, store objectStore, artifacts []pytho
 	for _, artifact := range checked {
 		data, err := store.GetBytes(ctx, artifact.Object)
 		if err != nil {
-			return nil, fmt.Errorf("download artifact %q: %w", artifact.Path, err)
+			return nil, fmt.Errorf("download artifact %q: %w%s", artifact.Path, err, objectStoreConsumerDeletePermissionHint(err, cfg.Bucket))
 		}
 		if int64(len(data)) > cfg.MaxOutputFileBytes {
 			return nil, SizeLimitError{Kind: "output_file", Path: artifact.Path, Size: int64(len(data)), Limit: cfg.MaxOutputFileBytes}
@@ -321,6 +321,17 @@ func downloadArtifacts(ctx context.Context, store objectStore, artifacts []pytho
 		result[artifact.Path] = data
 	}
 	return result, nil
+}
+
+func objectStoreConsumerDeletePermissionHint(err error, bucket string) string {
+	if err == nil {
+		return ""
+	}
+	errText := err.Error()
+	if !strings.Contains(errText, "permissions violation") || !strings.Contains(errText, "$JS.API.CONSUMER.DELETE.") {
+		return ""
+	}
+	return fmt.Sprintf(" (NATS Object Store reads require publish permission on %q to clean up ephemeral ordered consumers)", "$JS.API.CONSUMER.DELETE.OBJ_"+bucket+".>")
 }
 
 func decodeLogHeader(headers nats.Header, name string) ([]byte, error) {
