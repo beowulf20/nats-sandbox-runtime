@@ -1,3 +1,8 @@
 tmp/**
 bin/**
 firecracker-assets/**
+_bin_readonly_backup/
+_internal_readonly_backup/
+_gitignore_readonly_backup
+go.mod_readonly_backup
+go.sum_readonly_backup

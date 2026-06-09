@@ -3,12 +3,17 @@ package app
 import (
 	"os"
 	"strings"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
 
 func natsConnectOptions(name, token string) []nats.Option {
-	opts := []nats.Option{nats.Name(name)}
+	opts := []nats.Option{
+		nats.Name(name),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(250 * time.Millisecond),
+	}
 	if resolved := natsConnectToken(token); resolved != "" {
 		opts = append(opts, nats.Token(resolved))
 	}

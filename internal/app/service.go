@@ -50,7 +50,7 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 }
 
 func registerInstance(url string, index int) (serviceInstance, error) {
-	nc, err := nats.Connect(url, nats.Name(fmt.Sprintf("timestamp-service-%d", index)))
+	nc, err := nats.Connect(url, natsConnectOptions(fmt.Sprintf("timestamp-service-%d", index), "")...)
 	if err != nil {
 		return serviceInstance{}, fmt.Errorf("connect instance %d: %w", index, err)
 	}
