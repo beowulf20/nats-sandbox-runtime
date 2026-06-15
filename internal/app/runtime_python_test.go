@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +50,63 @@ func TestRuntimePythonLocalConfigForRunAppliesRequestOverrides(t *testing.T) {
 	}
 	if !got.HideFirecrackerLog {
 		t.Fatal("HideFirecrackerLog = false, want runtime runs to hide firecracker logs")
+	}
+}
+
+func TestRunRuntimePythonSupervisorRestartsAfterRegistrationClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	firstClosed := make(chan struct{})
+	secondClosed := make(chan struct{})
+	starts := make(chan int, 2)
+	startCount := 0
+	start := func(context.Context, RuntimePythonConfig, *RuntimeControlPlane) (*runtimePythonRegistration, error) {
+		startCount++
+		starts <- startCount
+		if startCount == 1 {
+			return &runtimePythonRegistration{closed: firstClosed}, nil
+		}
+		return &runtimePythonRegistration{closed: secondClosed}, nil
+	}
+
+	var out bytes.Buffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runRuntimePythonSupervisor(ctx, RuntimePythonConfig{
+			URL:         "nats://test",
+			Bucket:      "bucket",
+			MaxParallel: 1,
+		}, &out, NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), defaultLocalPythonConfig()), start, time.Millisecond)
+	}()
+
+	requireSupervisorStart(t, starts, 1)
+	close(firstClosed)
+	requireSupervisorStart(t, starts, 2)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("runRuntimePythonSupervisor returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runRuntimePythonSupervisor did not stop after context cancel")
+	}
+	if got := strings.Count(out.String(), "ready:"); got != 2 {
+		t.Fatalf("ready lines = %d, want 2 after restart; output=%q", got, out.String())
+	}
+}
+
+func requireSupervisorStart(t *testing.T, starts <-chan int, want int) {
+	t.Helper()
+	select {
+	case got := <-starts:
+		if got != want {
+			t.Fatalf("start = %d, want %d", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for start %d", want)
 	}
 }
 

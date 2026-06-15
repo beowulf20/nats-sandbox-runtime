@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -32,6 +33,8 @@ const (
 	runtimePythonControlSettingsListSubject   = "python.control.settings.list"
 	runtimePythonControlWorkersSetSubject     = "python.control.workers.set"
 	runtimePythonControlWorkersListSubject    = "python.control.workers.list"
+
+	runtimePythonReconnectDelay = time.Second
 )
 
 type PythonRunRequest struct {
@@ -83,28 +86,76 @@ type runtimePythonService struct {
 }
 
 func RunRuntimePython(ctx context.Context, cfg RuntimePythonConfig, out io.Writer) error {
-	registration, err := startRuntimePythonService(ctx, cfg, NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), cfg.LocalPython))
-	if err != nil {
+	if err := validateRuntimePythonConfig(cfg); err != nil {
 		return err
 	}
-	defer registration.Close()
-	fmt.Fprintf(out, "ready: service=%s endpoint=%s url=%s bucket=%s workers=%d\n", runtimePythonServiceName, runtimePythonEndpointSubject, cfg.URL, cfg.Bucket, cfg.MaxParallel)
-	<-ctx.Done()
-	return nil
+	controlPlane := NewRuntimeControlPlaneWithConfig(NewInMemorySettingsStore(), cfg.LocalPython)
+	return runRuntimePythonSupervisor(ctx, cfg, out, controlPlane, startRuntimePythonService, runtimePythonReconnectDelay)
 }
 
 type runtimePythonRegistration struct {
 	conn    *nats.Conn
 	service micro.Service
 	runtime *runtimePythonService
+	cancel  context.CancelFunc
+	closed  <-chan struct{}
 }
 
 func (r *runtimePythonRegistration) Close() {
+	if r.cancel != nil {
+		r.cancel()
+	}
 	if r.service != nil {
 		_ = r.service.Stop()
 	}
 	if r.conn != nil {
 		r.conn.Close()
+	}
+}
+
+type runtimePythonStartFunc func(context.Context, RuntimePythonConfig, *RuntimeControlPlane) (*runtimePythonRegistration, error)
+
+func runRuntimePythonSupervisor(ctx context.Context, cfg RuntimePythonConfig, out io.Writer, controlPlane *RuntimeControlPlane, start runtimePythonStartFunc, retryDelay time.Duration) error {
+	if retryDelay <= 0 {
+		retryDelay = runtimePythonReconnectDelay
+	}
+	for {
+		registration, err := start(ctx, cfg, controlPlane)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("runtime_python result=error error=%q retry_in=%s", err, retryDelay)
+			if !sleepRuntimePythonRetry(ctx, retryDelay) {
+				return nil
+			}
+			continue
+		}
+
+		fmt.Fprintf(out, "ready: service=%s endpoint=%s url=%s bucket=%s workers=%d\n", runtimePythonServiceName, runtimePythonEndpointSubject, cfg.URL, cfg.Bucket, cfg.MaxParallel)
+
+		select {
+		case <-ctx.Done():
+			registration.Close()
+			return nil
+		case <-registration.closed:
+			registration.Close()
+			log.Printf("runtime_python result=closed retry_in=%s", retryDelay)
+			if !sleepRuntimePythonRetry(ctx, retryDelay) {
+				return nil
+			}
+		}
+	}
+}
+
+func sleepRuntimePythonRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -121,12 +172,22 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 	if err := validateLocalPythonConfig(cfg.LocalPython); err != nil {
 		return nil, err
 	}
-	nc, err := nats.Connect(cfg.URL, natsConnectOptions("python-runtime-service", cfg.Token)...)
+	registrationCtx, cancelRegistration := context.WithCancel(ctx)
+	closedCh := make(chan struct{})
+	var closeOnce sync.Once
+	opts := append(natsConnectOptions("python-runtime-service", cfg.Token), nats.ClosedHandler(func(_ *nats.Conn) {
+		closeOnce.Do(func() {
+			close(closedCh)
+		})
+	}))
+	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
+		cancelRegistration()
 		return nil, fmt.Errorf("connect nats: %w", err)
 	}
 	js, err := jetstream.New(nc)
 	if err != nil {
+		cancelRegistration()
 		nc.Close()
 		return nil, fmt.Errorf("create jetstream context: %w", err)
 	}
@@ -135,6 +196,7 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		Description: "Python runtime workspace artifacts",
 	})
 	if err != nil {
+		cancelRegistration()
 		nc.Close()
 		return nil, fmt.Errorf("create object store %q: %w", cfg.Bucket, err)
 	}
@@ -143,6 +205,7 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 	}
 	workerPool, err := NewRuntimeWorkerPool(cfg)
 	if err != nil {
+		cancelRegistration()
 		nc.Close()
 		return nil, err
 	}
@@ -159,21 +222,24 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		Description: runtimePythonServiceDescription,
 	})
 	if err != nil {
+		cancelRegistration()
 		nc.Close()
 		return nil, fmt.Errorf("add runtime service: %w", err)
 	}
 	if err := srv.AddEndpoint("run", logMicroRequest(runtimePythonEndpointSubject, runtime.handleRun), micro.WithEndpointSubject(runtimePythonEndpointSubject)); err != nil {
+		cancelRegistration()
 		_ = srv.Stop()
 		nc.Close()
 		return nil, fmt.Errorf("add runtime endpoint: %w", err)
 	}
 	if err := registerRuntimePythonControlPlaneEndpoints(srv, runtime); err != nil {
+		cancelRegistration()
 		_ = srv.Stop()
 		nc.Close()
 		return nil, err
 	}
-	startRuntimeObjectCleanup(ctx, runtime.store, cfg.ArtifactTTL, cfg.CleanupInterval)
-	return &runtimePythonRegistration{conn: nc, service: srv, runtime: runtime}, nil
+	startRuntimeObjectCleanup(registrationCtx, runtime.store, cfg.ArtifactTTL, cfg.CleanupInterval)
+	return &runtimePythonRegistration{conn: nc, service: srv, runtime: runtime, cancel: cancelRegistration, closed: closedCh}, nil
 }
 
 func registerRuntimePythonControlPlaneEndpoints(srv micro.Service, runtime *runtimePythonService) error {

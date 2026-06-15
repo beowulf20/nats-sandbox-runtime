@@ -319,6 +319,9 @@ func validateRuntimePythonConfig(cfg RuntimePythonConfig) error {
 	if err := validateLocalPythonConfig(cfg.LocalPython); err != nil {
 		return err
 	}
+	if cfg.URL == "" {
+		return fmt.Errorf("url must not be empty")
+	}
 	if cfg.MaxParallel < 1 {
 		return fmt.Errorf("workers must be at least 1")
 	}
