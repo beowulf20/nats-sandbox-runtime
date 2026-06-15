@@ -159,6 +159,18 @@ func RunLocalPythonExec(ctx context.Context, cfg LocalPythonConfig) (LocalPython
 		return LocalPythonExecResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 	}
 	elapsed, err := runLocalPythonSnapshotOnce(ctx, cfg, paths, nil, &stdout, &stderr)
+	if isInvalidLocalPythonSnapshotLoadError(err) {
+		if invalidateErr := invalidateLocalPythonSnapshot(paths); invalidateErr != nil {
+			return LocalPythonExecResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, invalidateErr
+		}
+		if !cfg.HideFirecrackerLog {
+			fmt.Fprintf(&stderr, "python snapshot cache invalid after load failure: %v\n", err)
+		}
+		if rebuildErr := ensureLocalPythonSnapshot(ctx, cfg, paths, &stderr); rebuildErr != nil {
+			return LocalPythonExecResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, rebuildErr
+		}
+		elapsed, err = runLocalPythonSnapshotOnce(ctx, cfg, paths, nil, &stdout, &stderr)
+	}
 	if err != nil {
 		return LocalPythonExecResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 	}
@@ -285,6 +297,18 @@ func ensureLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths
 	}
 	if check := localPythonSnapshotCheck(paths, cfg); !check.OK {
 		return fmt.Errorf("snapshot validation failed after create: %s", check.Reason)
+	}
+	return nil
+}
+
+func invalidateLocalPythonSnapshot(paths localPythonSnapshotFiles) error {
+	for _, path := range []string{paths.StatePath, paths.MemoryPath, paths.VersionPath} {
+		if path == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("invalidate snapshot file %q: %w", path, err)
+		}
 	}
 	return nil
 }
@@ -508,6 +532,18 @@ func runLocalPythonSnapshotOnce(ctx context.Context, cfg LocalPythonConfig, path
 		return 0, err
 	}
 	return elapsed, nil
+}
+
+func isInvalidLocalPythonSnapshotLoadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return strings.Contains(text, "load snapshot:") &&
+		(strings.Contains(text, "Failed to load snapshot state") ||
+			strings.Contains(text, "Failed to get snapshot state") ||
+			strings.Contains(text, "bincode decoding") ||
+			strings.Contains(text, "LimitExceeded"))
 }
 
 func syncLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig, paths localPythonSnapshotFiles) error {

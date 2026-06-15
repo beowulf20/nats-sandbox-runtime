@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -348,6 +349,39 @@ func TestLocalPythonSnapshotCheckAcceptsMatchingVersion(t *testing.T) {
 	got := localPythonSnapshotCheck(paths, cfg)
 	if !got.OK || got.Reason != "" {
 		t.Fatalf("snapshot check = %#v, want ok", got)
+	}
+}
+
+func TestInvalidLocalPythonSnapshotLoadErrorDetectsFirecrackerDecodeFailure(t *testing.T) {
+	err := errors.New(`load snapshot: firecracker API PUT /snapshot/load returned 400 : {"fault_message":"Load snapshot error: Failed to restore from snapshot: Failed to get snapshot state from file: Failed to load snapshot state from file: An error occured during bincode decoding: LimitExceeded"}`)
+
+	if !isInvalidLocalPythonSnapshotLoadError(err) {
+		t.Fatalf("isInvalidLocalPythonSnapshotLoadError(%v) = false, want true", err)
+	}
+	if isInvalidLocalPythonSnapshotLoadError(errors.New("run firecracker snapshot: signal: killed")) {
+		t.Fatal("isInvalidLocalPythonSnapshotLoadError accepted unrelated error")
+	}
+}
+
+func TestInvalidateLocalPythonSnapshotRemovesStateMemoryAndVersion(t *testing.T) {
+	dir := t.TempDir()
+	paths := localPythonSnapshotPaths(dir)
+	for _, path := range []string{paths.StatePath, paths.MemoryPath, paths.VersionPath, paths.WorkspacePath} {
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile %s returned error: %v", path, err)
+		}
+	}
+
+	if err := invalidateLocalPythonSnapshot(paths); err != nil {
+		t.Fatalf("invalidateLocalPythonSnapshot returned error: %v", err)
+	}
+	for _, path := range []string{paths.StatePath, paths.MemoryPath, paths.VersionPath} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("snapshot file %s stat err = %v, want not exist", path, err)
+		}
+	}
+	if _, err := os.Stat(paths.WorkspacePath); err != nil {
+		t.Fatalf("workspace image stat err = %v, want retained", err)
 	}
 }
 
