@@ -76,6 +76,7 @@ RUN set -eu; \
 	install -m 0755 /tmp/fc-python-init /tmp/rootfs/usr/local/bin/fc-python-init; \
 	truncate -s "${GUEST_ROOTFS_SIZE}" /out/rootfs.ext4; \
 	mkfs.ext4 -q -d /tmp/rootfs /out/rootfs.ext4; \
+	sha256sum /out/rootfs.ext4 > /out/rootfs.ext4.sha256; \
 	rm -rf /tmp/rootfs /tmp/rootfs.squashfs
 
 FROM debian:bookworm-slim AS runtime
@@ -108,6 +109,7 @@ COPY --from=go-build /out/nats-sandbox-runtime /usr/local/bin/nats-sandbox-runti
 COPY --from=web-build /src/web/build ./web/build
 COPY --from=firecracker-assets /out/vmlinux.bin ./firecracker-assets/vmlinux.bin
 COPY --from=firecracker-assets /out/rootfs.ext4 ./firecracker-assets/rootfs.ext4
+COPY --from=firecracker-assets /out/rootfs.ext4.sha256 ./firecracker-assets/rootfs.ext4.sha256
 
 COPY --chmod=0755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

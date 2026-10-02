@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -306,9 +307,85 @@ func TestLocalPythonSnapshotCheckReportsVersionMismatch(t *testing.T) {
 	}
 
 	got := localPythonSnapshotCheck(paths, LocalPythonConfig{MemoryMiB: 128, VCPUs: 1, WorkspaceMiB: 16})
-	want := `snapshot version mismatch: got "workspace-v6 memory_mib=1024 vcpus=1 swap_mib=0 workspace_mib=16 drive_fd=1 system_ro=1 user_uid=65534", want "workspace-v6 memory_mib=128 vcpus=1 swap_mib=0 workspace_mib=16 drive_fd=1 system_ro=1 user_uid=65534"`
-	if got.OK || got.Reason != want {
-		t.Fatalf("snapshot check = %#v, want mismatch reason %q", got, want)
+	if got.OK || !containsAll(got.Reason, "snapshot version mismatch:", "memory_mib=1024", "memory_mib=128") {
+		t.Fatalf("snapshot check = %#v, want resource version mismatch", got)
+	}
+}
+
+func TestLocalPythonSnapshotRejectsChangedAssets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		grow bool
+	}{
+		{name: "rootfs", grow: true},
+		{name: "kernel"},
+		{name: "firecracker"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := LocalPythonConfig{
+				MemoryMiB: 128, VCPUs: 1, WorkspaceMiB: 16,
+				KernelPath: filepath.Join(dir, "kernel"), RootfsPath: filepath.Join(dir, "rootfs"), FirecrackerPath: filepath.Join(dir, "firecracker"),
+			}
+			for _, name := range []string{"kernel", "rootfs", "firecracker", "snapshot.bin", "memory.bin"} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("original"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			paths := localPythonSnapshotPaths(dir)
+			if err := os.WriteFile(paths.VersionPath, []byte(localPythonSnapshotVersion(cfg)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if !localPythonSnapshotCheck(paths, cfg).OK {
+				t.Fatal("unchanged assets rejected")
+			}
+			asset := filepath.Join(dir, tc.name)
+			info, err := os.Stat(asset)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.grow {
+				if err := os.WriteFile(asset, []byte("replacement rootfs"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				// Size alone must detect replacement even when mtime is preserved.
+				if err := os.Chtimes(asset, info.ModTime(), info.ModTime()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				modified := info.ModTime().Add(time.Second)
+				if err := os.Chtimes(asset, modified, modified); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := localPythonSnapshotCheck(paths, cfg); got.OK || !strings.Contains(got.Reason, "snapshot version mismatch") {
+				t.Fatalf("changed %s accepted: %#v", tc.name, got)
+			}
+		})
+	}
+}
+
+func TestLocalPythonSnapshotRootfsVersionUsesPackagedChecksum(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rootfs.ext4")
+	if err := os.WriteFile(path, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".sha256", []byte("first-build\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	version := localPythonSnapshotRootfsVersion(path)
+	// Normal guest filesystem writes must not invalidate every worker's cache.
+	if err := os.WriteFile(path, []byte("modified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := localPythonSnapshotRootfsVersion(path); got != version {
+		t.Fatalf("guest write changed rootfs version: %q != %q", got, version)
+	}
+	if err := os.WriteFile(path+".sha256", []byte("next-build\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := localPythonSnapshotRootfsVersion(path); got == version {
+		t.Fatal("same-size rootfs rebuild did not change snapshot version")
 	}
 }
 
@@ -477,6 +554,36 @@ func TestLocalPythonCompletionWriterDetectsMarker(t *testing.T) {
 	}
 	if stdout.String() != "hello\nDONE\n" {
 		t.Fatalf("stdout = %q, want copied writes", stdout.String())
+	}
+}
+
+func TestLocalPythonCompletionRequiresMarkerAfterCleanExit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+		failed bool
+	}{
+		{name: "python traceback", output: "SyntaxError: source code string cannot contain null bytes\n", failed: true},
+		{name: "empty output", failed: true},
+		{name: "completed script", output: "__TEST_COMPLETE__\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			writer := newLocalPythonCompletionWriter(&stdout, "__TEST_COMPLETE__")
+			cmd := exec.Command("sh", "-c", "printf '%s' \"$1\"", "completion-test", tc.output)
+			cmd.Stdout = writer
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			err := waitForLocalPythonSnapshotCompletion(context.Background(), LocalPythonConfig{KillAfterCompletion: true}, cmd, writer, nil)
+			if tc.failed {
+				if err == nil || !strings.Contains(err.Error(), "completion marker") {
+					t.Fatalf("error = %v, want missing completion marker", err)
+				}
+			} else if err != nil {
+				t.Fatalf("completed script returned error: %v", err)
+			}
+		})
 	}
 }
 

@@ -449,6 +449,13 @@ func waitForLocalPythonSnapshotCompletion(ctx context.Context, cfg LocalPythonCo
 	if killedAfterCompletion && localPythonProcessWasKilled(err) {
 		return nil
 	}
+	if err == nil {
+		select {
+		case <-completionWriter.Done():
+		default:
+			return fmt.Errorf("python execution exited without its completion marker")
+		}
+	}
 	return err
 }
 
@@ -1067,7 +1074,30 @@ func localPythonSnapshotCheck(paths localPythonSnapshotFiles, cfg LocalPythonCon
 }
 
 func localPythonSnapshotVersion(cfg LocalPythonConfig) string {
-	return fmt.Sprintf("workspace-v6 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 user_uid=65534", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB)
+	firecracker := localPythonFirecrackerBinary(cfg)
+	if resolved, err := exec.LookPath(firecracker); err == nil {
+		firecracker = resolved
+	}
+	return fmt.Sprintf("workspace-v7 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 user_uid=65534 kernel=%s rootfs=%s firecracker=%s", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB, localPythonSnapshotAssetVersion(cfg.KernelPath), localPythonSnapshotRootfsVersion(cfg.RootfsPath), localPythonSnapshotAssetVersion(firecracker))
+}
+
+func localPythonSnapshotAssetVersion(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return strconv.Quote(path) + ":missing"
+	}
+	return fmt.Sprintf("%q:%d:%d", path, info.Size(), info.ModTime().UnixNano())
+}
+
+func localPythonSnapshotRootfsVersion(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return strconv.Quote(path) + ":missing"
+	}
+	// Rootfs metadata changes during guest boot. Use the packaged build checksum,
+	// avoiding a full disk scan on every request and invalidation from mount writes.
+	digest, _ := os.ReadFile(path + ".sha256")
+	return fmt.Sprintf("%q:%d:%s", path, info.Size(), strings.TrimSpace(string(digest)))
 }
 
 func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) error {

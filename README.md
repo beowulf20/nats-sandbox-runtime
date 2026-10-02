@@ -472,6 +472,26 @@ Useful flags include:
 - `--runs`
 - `--parallel-runs`
 
+Snapshot caches are rebuilt when resource settings, kernel/Firecracker file
+metadata, or the rootfs path, size, or packaged build checksum changes. Docker
+images include `rootfs.ext4.sha256`; its build checksum remains stable across guest
+filesystem writes. For custom rootfs assets, generate a matching `.sha256` file
+with `sha256sum` before their first boot, and refresh it when replacing the image.
+Without that file, rootfs checks use its path and size; reset snapshots after a
+same-size replacement. Thread workspace images remain separate from the cache.
+
+If an older runtime reuses a snapshot from a previous image and Python imports
+fail with errors such as `source code string cannot contain null bytes`, reset the
+affected idle worker's snapshot in the console or through the API, then retry:
+
+```bash
+curl -X DELETE http://RUNTIME_HOST:8080/api/snapshots/workers/worker-1
+```
+
+This resets the worker snapshot cache without deleting thread workspaces. Runtime
+execution requires its completion marker before reporting success, so a guest
+Python failure followed by a clean VM exit is returned as an error.
+
 ## Runtime observability
 
 See [runtime observability](observability/README.md) for JSON logging, optional
