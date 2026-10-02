@@ -36,6 +36,10 @@ Build it:
 docker build -t nats-sandbox-runtime:local .
 ```
 
+Build defaults are `FIRECRACKER_VERSION=v1.14.0` and `GUEST_ROOTFS_SIZE=1536M`;
+no `--build-arg` flags are needed for these values. Both remain overridable with
+`--build-arg NAME=value`.
+
 The build downloads the Firecracker release binary and Firecracker CI guest assets, then patches the guest rootfs with this repo's Python init script. It does not require a local `firecracker-assets/` directory.
 
 Python modules available inside the Firecracker guest are declared in the repo-root `requirements.txt`; the Docker build installs those requirements into the packaged guest rootfs.

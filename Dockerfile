@@ -21,8 +21,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -buildvcs=false -o /o
 
 FROM debian:bookworm-slim AS firecracker-assets
 ARG TARGETARCH=amd64
-ARG FIRECRACKER_VERSION=latest
-ARG GUEST_ROOTFS_SIZE=2G
+ARG FIRECRACKER_VERSION=v1.14.0
+ARG GUEST_ROOTFS_SIZE=1536M
 
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends ca-certificates curl e2fsprogs grep squashfs-tools \
@@ -80,7 +80,7 @@ RUN set -eu; \
 
 FROM debian:bookworm-slim AS runtime
 ARG TARGETARCH=amd64
-ARG FIRECRACKER_VERSION=latest
+ARG FIRECRACKER_VERSION=v1.14.0
 
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends ca-certificates curl e2fsprogs tar \
