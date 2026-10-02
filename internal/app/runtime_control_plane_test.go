@@ -189,17 +189,17 @@ func TestRuntimePythonControlSettingsHandlers(t *testing.T) {
 	}
 
 	setReq := newRuntimePythonFakeRequest([]byte(`{"key":"runtime.default_memory_mib","value":256}`))
-	service.handleControlSettingsSet(setReq)
+	service.handleControlSettingsSet(context.Background(), setReq)
 	requireNoServiceError(t, setReq)
 	requireJSONEqual(t, setReq.response, `{"key":"runtime.default_memory_mib","status":"ok"}`)
 
 	getReq := newRuntimePythonFakeRequest([]byte(`{"key":"runtime.default_memory_mib"}`))
-	service.handleControlSettingsGet(getReq)
+	service.handleControlSettingsGet(context.Background(), getReq)
 	requireNoServiceError(t, getReq)
 	requireJSONEqual(t, getReq.response, `{"key":"runtime.default_memory_mib","found":true,"value":256}`)
 
 	listReq := newRuntimePythonFakeRequest(nil)
-	service.handleControlSettingsList(listReq)
+	service.handleControlSettingsList(context.Background(), listReq)
 	requireNoServiceError(t, listReq)
 	var listResp controlSettingsListResponse
 	if err := json.Unmarshal(listReq.response, &listResp); err != nil {
@@ -214,12 +214,12 @@ func TestRuntimePythonControlSettingsHandlers(t *testing.T) {
 	}
 
 	deleteReq := newRuntimePythonFakeRequest([]byte(`{"key":"runtime.default_memory_mib"}`))
-	service.handleControlSettingsDelete(deleteReq)
+	service.handleControlSettingsDelete(context.Background(), deleteReq)
 	requireNoServiceError(t, deleteReq)
 	requireJSONEqual(t, deleteReq.response, `{"key":"runtime.default_memory_mib","status":"deleted"}`)
 
 	resetReq := newRuntimePythonFakeRequest([]byte(`{"key":"runtime.default_memory_mib"}`))
-	service.handleControlSettingsGet(resetReq)
+	service.handleControlSettingsGet(context.Background(), resetReq)
 	requireNoServiceError(t, resetReq)
 	requireJSONEqual(t, resetReq.response, `{"key":"runtime.default_memory_mib","found":true,"value":128}`)
 }
@@ -230,15 +230,15 @@ func TestRuntimePythonControlSettingsHandlersRejectInvalidRequests(t *testing.T)
 	}
 
 	setInvalidJSON := newRuntimePythonFakeRequest([]byte(`{"key":"runtime.default_memory_mib","value":`))
-	service.handleControlSettingsSet(setInvalidJSON)
+	service.handleControlSettingsSet(context.Background(), setInvalidJSON)
 	requireServiceError(t, setInvalidJSON, "400")
 
 	setMissingValue := newRuntimePythonFakeRequest([]byte(`{"key":"runtime.default_memory_mib"}`))
-	service.handleControlSettingsSet(setMissingValue)
+	service.handleControlSettingsSet(context.Background(), setMissingValue)
 	requireServiceError(t, setMissingValue, "400")
 
 	getInvalidKey := newRuntimePythonFakeRequest([]byte(`{"key":"bad key"}`))
-	service.handleControlSettingsGet(getInvalidKey)
+	service.handleControlSettingsGet(context.Background(), getInvalidKey)
 	requireServiceError(t, getInvalidKey, "400")
 }
 
@@ -253,7 +253,7 @@ func TestRuntimePythonControlWorkerHandlers(t *testing.T) {
 	service := &runtimePythonService{workerPool: pool}
 
 	listReq := newRuntimePythonFakeRequest(nil)
-	service.handleControlWorkersList(listReq)
+	service.handleControlWorkersList(context.Background(), listReq)
 	requireNoServiceError(t, listReq)
 	var listResp controlWorkersListResponse
 	if err := json.Unmarshal(listReq.response, &listResp); err != nil {
@@ -264,7 +264,7 @@ func TestRuntimePythonControlWorkerHandlers(t *testing.T) {
 	}
 
 	setReq := newRuntimePythonFakeRequest([]byte(`{"count":3}`))
-	service.handleControlWorkersSet(setReq)
+	service.handleControlWorkersSet(context.Background(), setReq)
 	requireNoServiceError(t, setReq)
 	var setResp controlWorkersSetResponse
 	if err := json.Unmarshal(setReq.response, &setResp); err != nil {
@@ -284,15 +284,15 @@ func TestRuntimePythonControlWorkerHandlersRejectInvalidRequests(t *testing.T) {
 	service := &runtimePythonService{workerPool: pool}
 
 	setInvalidJSON := newRuntimePythonFakeRequest([]byte(`{"count":`))
-	service.handleControlWorkersSet(setInvalidJSON)
+	service.handleControlWorkersSet(context.Background(), setInvalidJSON)
 	requireServiceError(t, setInvalidJSON, "400")
 
 	setInvalidCount := newRuntimePythonFakeRequest([]byte(`{"count":0}`))
-	service.handleControlWorkersSet(setInvalidCount)
+	service.handleControlWorkersSet(context.Background(), setInvalidCount)
 	requireServiceError(t, setInvalidCount, "400")
 
 	listInvalid := newRuntimePythonFakeRequest([]byte(`{"extra":true}`))
-	service.handleControlWorkersList(listInvalid)
+	service.handleControlWorkersList(context.Background(), listInvalid)
 	requireServiceError(t, listInvalid, "400")
 }
 

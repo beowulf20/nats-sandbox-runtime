@@ -467,3 +467,65 @@ Useful flags include:
 - `--exec-timeout`
 - `--runs`
 - `--parallel-runs`
+
+## Runtime observability
+
+See [runtime observability](observability/README.md) for JSON logging, optional
+OTLP/gRPC export, Collector/Prometheus setup, and recovery behavior.
+
+### Connect to an existing Grafana stack
+
+The runtime sends logs, metrics, and traces over an outbound plaintext OTLP/gRPC
+connection to an OpenTelemetry Collector or Grafana Alloy OTLP receiver. No extra
+ports need publishing on the runtime service: keep `8080` for its HTTP API/UI.
+Grafana's UI port (`3000`) does not receive OTLP telemetry.
+
+Add these variables under `services.runtime.environment` in your Portainer Swarm
+stack, using a runtime image built with the observability support:
+
+```yaml
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://YOUR_COLLECTOR_HOST:4317"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+      OTEL_SERVICE_NAME: "nats-pyruntime"
+      LOG_LEVEL: "info"
+```
+
+Replace `YOUR_COLLECTOR_HOST` with an address reachable from the runtime container.
+Allow outbound TCP `4317` from the runtime to that receiver. Container `localhost`
+refers to the container itself. Use plaintext export only on a trusted network.
+
+If the Collector is reached through a Swarm node address from another host or
+Docker network, publish TCP `4317` on the **Collector service** in the observability
+stack and configure its OTLP/gRPC receiver to listen on `0.0.0.0:4317`:
+
+```yaml
+    ports:
+      - target: 4317
+        published: 4317
+        protocol: tcp
+        mode: ingress
+```
+
+When runtime and Collector share a Swarm overlay network, use the Collector's
+service DNS name, for example `http://otel-collector:4317`; publishing `4317` is
+unnecessary. Both services must join that network. The bundled local Compose
+example binds `4317` to host loopback, so it is not reachable from remote hosts.
+
+Configure the Collector/Alloy pipelines and Grafana data sources for your existing
+backends:
+
+| Signal | Path and use |
+| --- | --- |
+| Logs | Forward to Loki to search operational events and failures. |
+| Traces | Forward to Tempo to inspect preparation, execution, and upload spans. |
+| Metrics | Expose Collector metrics for Prometheus to scrape, then query Prometheus from Grafana. The bundled Collector uses internal port `9464`; the runtime has no `/metrics` listener. |
+
+These backend connections need network reachability between the relevant services;
+they do not require more runtime ports. In Grafana, configure a Loki derived field
+for `trace_id` linked to the Tempo data source, and Tempo trace-to-logs settings for
+the Loki data source, to navigate between correlated logs and traces.
+
+Setting the runtime endpoint enables export; backend forwarding and Grafana links
+must also be configured. The bundled Collector currently exports logs and traces
+to debug output only, without storing them in Loki or Tempo.

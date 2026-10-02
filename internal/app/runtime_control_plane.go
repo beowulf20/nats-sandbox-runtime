@@ -396,13 +396,13 @@ type controlWorkersSetResponse struct {
 
 type controlWorkersListResponse = RuntimeWorkerSnapshot
 
-func (s *runtimePythonService) handleControlSettingsGet(req micro.Request) {
+func (s *runtimePythonService) handleControlSettingsGet(ctx context.Context, req micro.Request) {
 	var payload controlSettingsKeyRequest
 	if err := decodeControlSettingsRequest(req.Data(), &payload); err != nil {
 		_ = req.Error("400", "invalid control settings get request", []byte(err.Error()))
 		return
 	}
-	value, found, err := s.controlPlane.GetSetting(context.Background(), payload.Key)
+	value, found, err := s.controlPlane.GetSetting(ctx, payload.Key)
 	if err != nil {
 		_ = req.Error("400", err.Error(), nil)
 		return
@@ -414,33 +414,33 @@ func (s *runtimePythonService) handleControlSettingsGet(req micro.Request) {
 	_ = req.RespondJSON(response)
 }
 
-func (s *runtimePythonService) handleControlSettingsSet(req micro.Request) {
+func (s *runtimePythonService) handleControlSettingsSet(ctx context.Context, req micro.Request) {
 	var payload controlSettingsSetRequest
 	if err := decodeControlSettingsRequest(req.Data(), &payload); err != nil {
 		_ = req.Error("400", "invalid control settings set request", []byte(err.Error()))
 		return
 	}
-	if err := s.controlPlane.SetSetting(context.Background(), payload.Key, payload.Value); err != nil {
+	if err := s.controlPlane.SetSetting(ctx, payload.Key, payload.Value); err != nil {
 		_ = req.Error("400", err.Error(), nil)
 		return
 	}
 	_ = req.RespondJSON(controlSettingsStatusResponse{Key: payload.Key, Status: "ok"})
 }
 
-func (s *runtimePythonService) handleControlSettingsDelete(req micro.Request) {
+func (s *runtimePythonService) handleControlSettingsDelete(ctx context.Context, req micro.Request) {
 	var payload controlSettingsKeyRequest
 	if err := decodeControlSettingsRequest(req.Data(), &payload); err != nil {
 		_ = req.Error("400", "invalid control settings delete request", []byte(err.Error()))
 		return
 	}
-	if err := s.controlPlane.DeleteSetting(context.Background(), payload.Key); err != nil {
+	if err := s.controlPlane.DeleteSetting(ctx, payload.Key); err != nil {
 		_ = req.Error("400", err.Error(), nil)
 		return
 	}
 	_ = req.RespondJSON(controlSettingsStatusResponse{Key: payload.Key, Status: "deleted"})
 }
 
-func (s *runtimePythonService) handleControlSettingsList(req micro.Request) {
+func (s *runtimePythonService) handleControlSettingsList(ctx context.Context, req micro.Request) {
 	if len(req.Data()) > 0 {
 		var payload map[string]json.RawMessage
 		if err := json.Unmarshal(req.Data(), &payload); err != nil {
@@ -452,7 +452,7 @@ func (s *runtimePythonService) handleControlSettingsList(req micro.Request) {
 			return
 		}
 	}
-	settings, err := s.controlPlane.ListSettings(context.Background())
+	settings, err := s.controlPlane.ListSettings(ctx)
 	if err != nil {
 		_ = req.Error("500", err.Error(), nil)
 		return
@@ -467,7 +467,7 @@ func decodeControlSettingsRequest(data []byte, payload any) error {
 	return json.Unmarshal(data, payload)
 }
 
-func (s *runtimePythonService) handleControlWorkersSet(req micro.Request) {
+func (s *runtimePythonService) handleControlWorkersSet(_ context.Context, req micro.Request) {
 	var payload controlWorkersSetRequest
 	if err := decodeControlSettingsRequest(req.Data(), &payload); err != nil {
 		_ = req.Error("400", "invalid control workers set request", []byte(err.Error()))
@@ -486,7 +486,7 @@ func (s *runtimePythonService) handleControlWorkersSet(req micro.Request) {
 	_ = req.RespondJSON(controlWorkersSetResponse{Status: "ok", DesiredCount: pool.DesiredCount(), Workers: workers})
 }
 
-func (s *runtimePythonService) handleControlWorkersList(req micro.Request) {
+func (s *runtimePythonService) handleControlWorkersList(_ context.Context, req micro.Request) {
 	if len(req.Data()) > 0 {
 		var payload map[string]json.RawMessage
 		if err := json.Unmarshal(req.Data(), &payload); err != nil {

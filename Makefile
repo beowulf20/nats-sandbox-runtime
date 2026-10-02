@@ -32,3 +32,5 @@ firecracker:
 	cp "$$TMPDIR/release-$$LATEST-$$ARCH/firecracker-$$LATEST-$$ARCH" bin/firecracker; \
 	chmod +x bin/firecracker; \
 	bin/firecracker --version
+
+include observability/Makefile

@@ -3,7 +3,11 @@ package app
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"nats-sandbox-runtime/internal/observability"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -61,6 +65,7 @@ type LocalPythonConfig struct {
 }
 
 type RuntimePythonConfig struct {
+	Telemetry       *observability.Runtime
 	URL             string
 	Token           string
 	Bucket          string
@@ -252,7 +257,11 @@ func newRuntimePythonCommand(runRuntimePython func(context.Context, RuntimePytho
 			if runRuntimePython == nil {
 				return fmt.Errorf("runtime python runner is not configured")
 			}
-			return runRuntimePython(cmd.Context(), runtimeCfg)
+			return runObserved(cmd.Context(), func(ctx context.Context, telemetry *observability.Runtime) error {
+				cfg := runtimeCfg
+				cfg.Telemetry = telemetry
+				return runRuntimePython(ctx, cfg)
+			})
 		},
 	}
 	addRuntimePythonFlags(cmd, &runtimeCfg)
@@ -282,7 +291,11 @@ func newRuntimeAPICommand(runRuntimeAPI func(context.Context, RuntimeAPIConfig) 
 			if runRuntimeAPI == nil {
 				return fmt.Errorf("runtime api runner is not configured")
 			}
-			return runRuntimeAPI(cmd.Context(), cfg)
+			return runObserved(cmd.Context(), func(ctx context.Context, telemetry *observability.Runtime) error {
+				runtimeCfg := cfg
+				runtimeCfg.Runtime.Telemetry = telemetry
+				return runRuntimeAPI(ctx, runtimeCfg)
+			})
 		},
 	}
 	cmd.Flags().StringVar(&cfg.Listen, "listen", cfg.Listen, "local HTTP listen address for the runtime API and web console")
@@ -306,6 +319,31 @@ func defaultRuntimePythonConfig() RuntimePythonConfig {
 		ArtifactTTL:     defaultArtifactTTL,
 		CleanupInterval: defaultArtifactCleanup,
 	}
+}
+
+func runObserved(ctx context.Context, run func(context.Context, *observability.Runtime) error) error {
+	cfg, err := observability.ConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	telemetry, err := observability.New(ctx, cfg, os.Stderr)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), observability.ExportTimeout)
+		defer cancel()
+		_ = telemetry.Shutdown(shutdownCtx)
+	}()
+	err = run(ctx, telemetry)
+	result, level := "success", slog.LevelInfo
+	if err != nil {
+		result, level = "error", slog.LevelError
+	}
+	telemetry.Logger.Log(context.Background(), level, "runtime stopped", "event", "runtime.stopped", "result", result)
+	return err
 }
 
 func envString(name, fallback string) string {

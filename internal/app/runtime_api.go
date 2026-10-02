@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"nats-sandbox-runtime/internal/observability"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,6 +17,10 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type RuntimeAPIOverviewResponse struct {
@@ -88,7 +93,7 @@ func RunRuntimeAPI(ctx context.Context, cfg RuntimeAPIConfig, out io.Writer) err
 		cfg:          cfg,
 		conn:         registration.conn,
 		microService: registration.service,
-	}, cfg.WebDir)
+	}, cfg.WebDir, runtimeTelemetry(cfg.Runtime))
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
@@ -101,13 +106,15 @@ func RunRuntimeAPI(ctx context.Context, cfg RuntimeAPIConfig, out io.Writer) err
 		errCh <- server.Serve(listener)
 	}()
 
-	fmt.Fprintf(out, "ready: service=%s endpoint=%s api=http://%s url=%s bucket=%s workers=%d web_dir=%s\n", runtimePythonServiceName, runtimePythonEndpointSubject, listener.Addr().String(), cfg.Runtime.URL, cfg.Runtime.Bucket, cfg.Runtime.MaxParallel, cfg.WebDir)
+	fmt.Fprintf(out, "ready: service=%s endpoint=%s api=http://%s url=%s bucket=%s workers=%d web_dir=%s\n", runtimePythonServiceName, runtimePythonEndpointSubject, listener.Addr().String(), redactedNATSURL(cfg.Runtime.URL), cfg.Runtime.Bucket, cfg.Runtime.MaxParallel, cfg.WebDir)
+	runtimeTelemetry(cfg.Runtime).Logger.InfoContext(ctx, "runtime API ready", "event", "runtime.ready", "transport", "http", "listen", listener.Addr().String())
 
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
 			return fmt.Errorf("shutdown runtime api: %w", err)
 		}
 		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -178,13 +185,19 @@ func (p runtimeAPIServiceOverviewProvider) Overview(ctx context.Context) (Runtim
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	msg, err := p.conn.RequestWithContext(requestCtx, subject, nil)
+	requestCtx, span := runtimeTelemetry(p.cfg.Runtime).Tracer.Start(requestCtx, "nats.request micro.info", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attribute.String("messaging.system", "nats")))
+	defer span.End()
+	request := nats.NewMsg(subject)
+	observability.Propagator.Inject(requestCtx, natsTraceCarrier(request.Header))
+	msg, err := p.conn.RequestMsgWithContext(requestCtx, request)
 	if err != nil {
+		span.SetStatus(codes.Error, "request_failure")
 		response.Runtime.Error = err.Error()
 		return response, nil
 	}
 	var info micro.Info
 	if err := json.Unmarshal(msg.Data, &info); err != nil {
+		span.SetStatus(codes.Error, "decode_failure")
 		response.Runtime.Error = err.Error()
 		return response, nil
 	}
@@ -207,17 +220,22 @@ func runtimeAPIEndpointStatuses(endpoints []micro.EndpointInfo) []RuntimeAPIEndp
 	return statuses
 }
 
-func newRuntimeAPIHTTPHandler(controlPlane *RuntimeControlPlane, workerPool *RuntimeWorkerPool, workspaces *RuntimeWorkspaceManager, overviewProvider runtimeAPIOverviewProvider, webDir string) http.Handler {
+func newRuntimeAPIHTTPHandler(controlPlane *RuntimeControlPlane, workerPool *RuntimeWorkerPool, workspaces *RuntimeWorkspaceManager, overviewProvider runtimeAPIOverviewProvider, webDir string, telemetry ...*observability.Runtime) http.Handler {
 	if controlPlane == nil {
 		controlPlane = NewRuntimeControlPlane(NewInMemorySettingsStore())
 	}
 	mux := http.NewServeMux()
+	t := localRuntimeTelemetry()
+	if len(telemetry) > 0 {
+		t = telemetry[0]
+	}
 	api := &runtimeAPIHTTPServer{
 		controlPlane:     controlPlane,
 		workerPool:       workerPool,
 		workspaces:       workspaces,
 		overviewProvider: overviewProvider,
 		webDir:           webDir,
+		telemetry:        t,
 	}
 	mux.HandleFunc("/api/overview", api.handleOverview)
 	mux.HandleFunc("/api/workers/events", api.handleWorkerEvents)
@@ -229,7 +247,7 @@ func newRuntimeAPIHTTPHandler(controlPlane *RuntimeControlPlane, workerPool *Run
 	mux.HandleFunc("/api/settings", api.handleSettingsList)
 	mux.HandleFunc("/api/settings/", api.handleSetting)
 	mux.HandleFunc("/", api.handleStatic)
-	return logHTTPRequest(mux)
+	return observeHTTPRequest(t, mux)
 }
 
 type runtimeAPIHTTPServer struct {
@@ -238,6 +256,7 @@ type runtimeAPIHTTPServer struct {
 	workspaces       *RuntimeWorkspaceManager
 	overviewProvider runtimeAPIOverviewProvider
 	webDir           string
+	telemetry        *observability.Runtime
 }
 
 func (s *runtimeAPIHTTPServer) handleOverview(w http.ResponseWriter, r *http.Request) {
@@ -319,6 +338,14 @@ func (s *runtimeAPIHTTPServer) handleWorkerEvents(w http.ResponseWriter, r *http
 
 	events, cancel := s.workerPool.Subscribe()
 	defer cancel()
+	if s.telemetry != nil {
+		s.telemetry.SSEConnections.Add(r.Context(), 1, metric.WithAttributes(attribute.String("event", "open")))
+		s.telemetry.Logger.InfoContext(r.Context(), "worker stream opened", "event", "http.sse.open", "route", "/api/workers/events")
+		defer func() {
+			s.telemetry.SSEConnections.Add(r.Context(), 1, metric.WithAttributes(attribute.String("event", "close")))
+			s.telemetry.Logger.InfoContext(r.Context(), "worker stream closed", "event", "http.sse.close", "route", "/api/workers/events")
+		}()
+	}
 	for {
 		select {
 		case <-r.Context().Done():

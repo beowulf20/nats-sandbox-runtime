@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net"
@@ -21,7 +20,7 @@ func TestRunReconnectsAfterEmbeddedServerRestart(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	var out bytes.Buffer
+	var out lockedTestBuffer
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- Run(ctx, Config{URL: url, Instances: 1}, &out)
@@ -65,7 +64,7 @@ func TestRunRuntimePythonServiceListableAfterEmbeddedServerRestart(t *testing.T)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	var out bytes.Buffer
+	var out lockedTestBuffer
 	errCh := make(chan error, 1)
 	cfg := defaultRuntimePythonConfig()
 	cfg.URL = url

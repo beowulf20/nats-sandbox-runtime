@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -48,7 +47,7 @@ func TestRuntimePythonServiceEndToEnd(t *testing.T) {
 	cfg.LocalPython.RootfsPath = filepath.Join(repoRoot, defaultLocalRootfsPath)
 	cfg.LocalPython.FirecrackerPath = filepath.Join(repoRoot, defaultFirecrackerPath)
 
-	var serviceOutput bytes.Buffer
+	var serviceOutput lockedTestBuffer
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- RunRuntimePython(ctx, cfg, &serviceOutput)
@@ -148,7 +147,7 @@ func TestRuntimePythonControlSettingsEndToEnd(t *testing.T) {
 		TruncateLogMiB: 1,
 	}
 
-	var serviceOutput bytes.Buffer
+	var serviceOutput lockedTestBuffer
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- RunRuntimePython(ctx, cfg, &serviceOutput)
@@ -252,7 +251,7 @@ func TestRuntimeAPIEndToEnd(t *testing.T) {
 		t.Fatalf("WriteFile index returned error: %v", err)
 	}
 
-	var serviceOutput bytes.Buffer
+	var serviceOutput lockedTestBuffer
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- RunRuntimeAPI(ctx, cfg, &serviceOutput)
@@ -385,7 +384,7 @@ func requestRuntimeControlSetting(t *testing.T, nc *nats.Conn, subject string, p
 	return msg
 }
 
-func waitForString(t *testing.T, buf *bytes.Buffer, needle string, timeout time.Duration) {
+func waitForString(t *testing.T, buf interface{ String() string }, needle string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

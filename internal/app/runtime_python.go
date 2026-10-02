@@ -8,7 +8,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
+	"log/slog"
+	"nats-sandbox-runtime/internal/observability"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +20,9 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nats.go/micro"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -83,6 +87,7 @@ type runtimePythonService struct {
 	controlPlane *RuntimeControlPlane
 	workerPool   *RuntimeWorkerPool
 	workspaces   *RuntimeWorkspaceManager
+	execute      func(context.Context, LocalPythonConfig) (LocalPythonExecResult, error)
 }
 
 func RunRuntimePython(ctx context.Context, cfg RuntimePythonConfig, out io.Writer) error {
@@ -94,23 +99,30 @@ func RunRuntimePython(ctx context.Context, cfg RuntimePythonConfig, out io.Write
 }
 
 type runtimePythonRegistration struct {
-	conn    *nats.Conn
-	service micro.Service
-	runtime *runtimePythonService
-	cancel  context.CancelFunc
-	closed  <-chan struct{}
+	conn      *nats.Conn
+	service   micro.Service
+	runtime   *runtimePythonService
+	cancel    context.CancelFunc
+	closed    <-chan struct{}
+	workers   metric.Registration
+	closeOnce sync.Once
 }
 
 func (r *runtimePythonRegistration) Close() {
-	if r.cancel != nil {
-		r.cancel()
-	}
-	if r.service != nil {
-		_ = r.service.Stop()
-	}
-	if r.conn != nil {
-		r.conn.Close()
-	}
+	r.closeOnce.Do(func() {
+		if r.workers != nil {
+			_ = r.workers.Unregister()
+		}
+		if r.cancel != nil {
+			r.cancel()
+		}
+		if r.service != nil {
+			_ = r.service.Stop()
+		}
+		if r.conn != nil {
+			r.conn.Close()
+		}
+	})
 }
 
 type runtimePythonStartFunc func(context.Context, RuntimePythonConfig, *RuntimeControlPlane) (*runtimePythonRegistration, error)
@@ -125,14 +137,15 @@ func runRuntimePythonSupervisor(ctx context.Context, cfg RuntimePythonConfig, ou
 			if ctx.Err() != nil {
 				return nil
 			}
-			log.Printf("runtime_python result=error error=%q retry_in=%s", err, retryDelay)
+			runtimeTelemetry(cfg).Logger.WarnContext(ctx, "runtime registration failed", "event", "runtime.registration.error", "error_class", "registration_failure", "retry_ms", retryDelay.Milliseconds())
 			if !sleepRuntimePythonRetry(ctx, retryDelay) {
 				return nil
 			}
 			continue
 		}
 
-		fmt.Fprintf(out, "ready: service=%s endpoint=%s url=%s bucket=%s workers=%d\n", runtimePythonServiceName, runtimePythonEndpointSubject, cfg.URL, cfg.Bucket, cfg.MaxParallel)
+		fmt.Fprintf(out, "ready: service=%s endpoint=%s url=%s bucket=%s workers=%d\n", runtimePythonServiceName, runtimePythonEndpointSubject, redactedNATSURL(cfg.URL), cfg.Bucket, cfg.MaxParallel)
+		runtimeTelemetry(cfg).Logger.InfoContext(ctx, "runtime ready", "event", "runtime.ready", "transport", "nats", "url", redactedNATSURL(cfg.URL), "workers", cfg.MaxParallel)
 
 		select {
 		case <-ctx.Done():
@@ -140,7 +153,7 @@ func runRuntimePythonSupervisor(ctx context.Context, cfg RuntimePythonConfig, ou
 			return nil
 		case <-registration.closed:
 			registration.Close()
-			log.Printf("runtime_python result=closed retry_in=%s", retryDelay)
+			runtimeTelemetry(cfg).Logger.WarnContext(ctx, "runtime registration closed", "event", "runtime.registration.closed", "retry_ms", retryDelay.Milliseconds())
 			if !sleepRuntimePythonRetry(ctx, retryDelay) {
 				return nil
 			}
@@ -175,10 +188,20 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 	registrationCtx, cancelRegistration := context.WithCancel(ctx)
 	closedCh := make(chan struct{})
 	var closeOnce sync.Once
+	telemetry := runtimeTelemetry(cfg)
 	opts := append(natsConnectOptions("python-runtime-service", cfg.Token), nats.ClosedHandler(func(_ *nats.Conn) {
 		closeOnce.Do(func() {
 			close(closedCh)
 		})
+	}), nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+		if err == nil && nc.IsClosed() {
+			telemetry.Logger.Info("NATS connection closed", "event", "nats.closed")
+			return
+		}
+		telemetry.Logger.Warn("NATS disconnected", "event", "nats.disconnected", "error_class", "connection_lost")
+	}), nats.ReconnectHandler(func(nc *nats.Conn) {
+		telemetry.Reconnects.Add(context.Background(), 1)
+		telemetry.Logger.Info("NATS reconnected", "event", "nats.reconnected", "url", nc.ConnectedUrlRedacted())
 	}))
 	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
@@ -226,7 +249,7 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		nc.Close()
 		return nil, fmt.Errorf("add runtime service: %w", err)
 	}
-	if err := srv.AddEndpoint("run", logMicroRequest(runtimePythonEndpointSubject, runtime.handleRun), micro.WithEndpointSubject(runtimePythonEndpointSubject)); err != nil {
+	if err := srv.AddEndpoint("run", observeMicroRequest(telemetry, runtimePythonEndpointSubject, runtime.handleRun), micro.WithEndpointSubject(runtimePythonEndpointSubject)); err != nil {
 		cancelRegistration()
 		_ = srv.Stop()
 		nc.Close()
@@ -238,15 +261,22 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		nc.Close()
 		return nil, err
 	}
-	startRuntimeObjectCleanup(registrationCtx, runtime.store, cfg.ArtifactTTL, cfg.CleanupInterval)
-	return &runtimePythonRegistration{conn: nc, service: srv, runtime: runtime, cancel: cancelRegistration, closed: closedCh}, nil
+	workers, err := observeWorkers(telemetry, workerPool)
+	if err != nil {
+		cancelRegistration()
+		_ = srv.Stop()
+		nc.Close()
+		return nil, err
+	}
+	startRuntimeObjectCleanup(registrationCtx, runtime.store, cfg.ArtifactTTL, cfg.CleanupInterval, telemetry)
+	return &runtimePythonRegistration{conn: nc, service: srv, runtime: runtime, cancel: cancelRegistration, closed: closedCh, workers: workers}, nil
 }
 
 func registerRuntimePythonControlPlaneEndpoints(srv micro.Service, runtime *runtimePythonService) error {
 	endpoints := []struct {
 		name    string
 		subject string
-		handler micro.HandlerFunc
+		handler func(context.Context, micro.Request)
 	}{
 		{name: "control-settings-get", subject: runtimePythonControlSettingsGetSubject, handler: runtime.handleControlSettingsGet},
 		{name: "control-settings-set", subject: runtimePythonControlSettingsSetSubject, handler: runtime.handleControlSettingsSet},
@@ -256,14 +286,14 @@ func registerRuntimePythonControlPlaneEndpoints(srv micro.Service, runtime *runt
 		{name: "control-workers-list", subject: runtimePythonControlWorkersListSubject, handler: runtime.handleControlWorkersList},
 	}
 	for _, endpoint := range endpoints {
-		if err := srv.AddEndpoint(endpoint.name, logMicroRequest(endpoint.subject, endpoint.handler), micro.WithEndpointSubject(endpoint.subject)); err != nil {
+		if err := srv.AddEndpoint(endpoint.name, observeMicroRequest(runtimeTelemetry(runtime.cfg), endpoint.subject, endpoint.handler), micro.WithEndpointSubject(endpoint.subject)); err != nil {
 			return fmt.Errorf("add runtime endpoint %s: %w", endpoint.subject, err)
 		}
 	}
 	return nil
 }
 
-func (s *runtimePythonService) handleRun(req micro.Request) {
+func (s *runtimePythonService) handleRun(ctx context.Context, req micro.Request) {
 	workerPool := s.workerPool
 	if workerPool == nil {
 		var err error
@@ -287,7 +317,7 @@ func (s *runtimePythonService) handleRun(req micro.Request) {
 			return
 		}
 	}
-	resp, stdout, stderr, err := s.run(req, worker, runReq)
+	resp, stdout, stderr, err := s.run(ctx, worker, runReq)
 	if err != nil {
 		headers := s.logHeaders(stdout, stderr)
 		_ = req.Error("500", err.Error(), nil, micro.WithHeaders(micro.Headers(headers)))
@@ -297,12 +327,31 @@ func (s *runtimePythonService) handleRun(req micro.Request) {
 	_ = req.RespondJSON(resp, micro.WithHeaders(micro.Headers(headers)))
 }
 
-func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq PythonRunRequest) (PythonRunResponse, []byte, []byte, error) {
-	ctx := context.Background()
+func (s *runtimePythonService) run(ctx context.Context, worker RuntimeWorker, runReq PythonRunRequest) (_ PythonRunResponse, _ []byte, _ []byte, err error) {
+	telemetry := runtimeTelemetry(s.cfg)
+	start := time.Now()
 	runID := runReq.RunID
 	if runID == "" {
 		runID = nats.NewInbox()[5:]
 	}
+	ids := []attribute.KeyValue{attribute.String("run_id", runID), attribute.String("thread_id", runReq.ThreadID), attribute.String("worker_id", worker.ID)}
+	parentCtx := ctx
+	ctx, prepareSpan := telemetry.Tracer.Start(ctx, "runtime.prepare", trace.WithAttributes(ids...))
+	defer func() {
+		if prepareSpan != nil {
+			endRuntimeSpan(prepareSpan, err, "preparation_failure")
+		}
+		result := "success"
+		level := slog.LevelInfo
+		if err != nil {
+			result = "error"
+			level = slog.LevelError
+		}
+		attrs := metric.WithAttributes(attribute.String("result", result))
+		telemetry.Runs.Add(parentCtx, 1, attrs)
+		telemetry.RunDuration.Record(parentCtx, time.Since(start).Seconds(), attrs)
+		telemetry.Logger.Log(parentCtx, level, "runtime run completed", "event", "runtime.run.completed", "run_id", runID, "thread_id", runReq.ThreadID, "worker_id", worker.ID, "result", result, "duration_ms", float64(time.Since(start))/float64(time.Millisecond))
+	}()
 	workspaceLease, err := s.workspaceLeaseForRun(runReq, runID)
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, err
@@ -348,19 +397,29 @@ func (s *runtimePythonService) run(_ micro.Request, worker RuntimeWorker, runReq
 	startMarker := "__NATS_SANDBOX_RUNTIME_STDOUT_START_" + sanitizeRunIDForMarker(runID) + "__"
 	endMarker := "__NATS_SANDBOX_RUNTIME_STDOUT_END_" + sanitizeRunIDForMarker(runID) + "__"
 	completionMarker := "__NATS_SANDBOX_RUNTIME_COMPLETE_" + sanitizeRunIDForMarker(runID) + "__"
-	cfg, err := s.localPythonConfigForRun(worker, runReq, workDir, workspaceDir, workspaceImagePath, wrapRuntimePythonCode(code, startMarker, endMarker, completionMarker))
+	cfg, err := s.localPythonConfigForRunContext(ctx, worker, runReq, workDir, workspaceDir, workspaceImagePath, wrapRuntimePythonCode(code, startMarker, endMarker, completionMarker))
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, err
 	}
 	cfg.CompletionMarker = completionMarker
 	cfg.KillAfterCompletion = true
 	cfg.SkipGuestWorkspaceSync = true
-	result, err := RunLocalPythonExec(ctx, cfg)
+	prepareSpan.End()
+	prepareSpan = nil
+	executeCtx, executeSpan := telemetry.Tracer.Start(parentCtx, "runtime.execute", trace.WithAttributes(ids...))
+	execute := s.execute
+	if execute == nil {
+		execute = RunLocalPythonExec
+	}
+	result, err := execute(executeCtx, cfg)
+	endRuntimeSpan(executeSpan, err, "execution_failure")
 	stdout := extractRuntimePythonStdout(result.Stdout, startMarker, endMarker)
 	if err != nil {
 		return PythonRunResponse{}, stdout, result.Stderr, err
 	}
-	artifacts, err := uploadRuntimeArtifacts(ctx, s.store, runID, workspaceDir)
+	uploadCtx, uploadSpan := telemetry.Tracer.Start(parentCtx, "runtime.upload", trace.WithAttributes(ids...))
+	artifacts, err := uploadRuntimeArtifacts(uploadCtx, s.store, runID, workspaceDir)
+	endRuntimeSpan(uploadSpan, err, "upload_failure")
 	if err != nil {
 		return PythonRunResponse{}, stdout, result.Stderr, err
 	}
@@ -402,10 +461,14 @@ func (s *runtimePythonService) workspaceLease(key string) (RuntimeWorkspaceLease
 }
 
 func (s *runtimePythonService) localPythonConfigForRun(worker RuntimeWorker, runReq PythonRunRequest, workDir, workspaceDir, workspaceImagePath, code string) (LocalPythonConfig, error) {
+	return s.localPythonConfigForRunContext(context.Background(), worker, runReq, workDir, workspaceDir, workspaceImagePath, code)
+}
+
+func (s *runtimePythonService) localPythonConfigForRunContext(ctx context.Context, worker RuntimeWorker, runReq PythonRunRequest, workDir, workspaceDir, workspaceImagePath, code string) (LocalPythonConfig, error) {
 	cfg := s.cfg.LocalPython
 	var err error
 	if s.controlPlane != nil {
-		cfg, err = s.controlPlane.ApplyToLocalPythonConfig(context.Background(), cfg)
+		cfg, err = s.controlPlane.ApplyToLocalPythonConfig(ctx, cfg)
 		if err != nil {
 			return LocalPythonConfig{}, err
 		}
@@ -527,12 +590,12 @@ type runtimeObjectStore interface {
 	Delete(ctx context.Context, name string) error
 }
 
-func startRuntimeObjectCleanup(ctx context.Context, store runtimeObjectStore, ttl, interval time.Duration) {
+func startRuntimeObjectCleanup(ctx context.Context, store runtimeObjectStore, ttl, interval time.Duration, telemetry ...*observability.Runtime) {
 	if store == nil || ttl <= 0 || interval <= 0 {
 		return
 	}
 	go func() {
-		runRuntimeObjectCleanupCheck(ctx, store, ttl)
+		runRuntimeObjectCleanupCheck(ctx, store, ttl, telemetry...)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -540,24 +603,28 @@ func startRuntimeObjectCleanup(ctx context.Context, store runtimeObjectStore, tt
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				runRuntimeObjectCleanupCheck(ctx, store, ttl)
+				runRuntimeObjectCleanupCheck(ctx, store, ttl, telemetry...)
 			}
 		}
 	}()
 }
 
-func runRuntimeObjectCleanupCheck(ctx context.Context, store runtimeObjectStore, ttl time.Duration) {
-	deleted, err := cleanupRuntimeObjects(ctx, store, time.Now().Add(-ttl))
+func runRuntimeObjectCleanupCheck(ctx context.Context, store runtimeObjectStore, ttl time.Duration, telemetry ...*observability.Runtime) {
+	t := localRuntimeTelemetry()
+	if len(telemetry) > 0 {
+		t = telemetry[0]
+	}
+	deleted, err := cleanupRuntimeObjects(ctx, store, time.Now().Add(-ttl), t)
 	if err != nil {
-		log.Printf("runtime_object_cleanup result=error error=%q", err)
+		t.Logger.WarnContext(ctx, "runtime object cleanup failed", "event", "runtime.cleanup.error", "error_class", "cleanup_failure", "deleted", deleted)
 		return
 	}
 	if deleted > 0 {
-		log.Printf("runtime_object_cleanup result=success deleted=%d", deleted)
+		t.Logger.InfoContext(ctx, "runtime objects cleaned", "event", "runtime.cleanup.completed", "deleted", deleted)
 	}
 }
 
-func cleanupRuntimeObjects(ctx context.Context, store runtimeObjectStore, cutoff time.Time) (int, error) {
+func cleanupRuntimeObjects(ctx context.Context, store runtimeObjectStore, cutoff time.Time, telemetry ...*observability.Runtime) (int, error) {
 	objects, err := store.List(ctx)
 	if errors.Is(err, jetstream.ErrNoObjectsFound) {
 		return 0, nil
@@ -570,8 +637,12 @@ func cleanupRuntimeObjects(ctx context.Context, store runtimeObjectStore, cutoff
 		if object == nil || !isRuntimeOwnedObjectName(object.Name) || object.ModTime.After(cutoff) {
 			continue
 		}
-		if err := store.Delete(ctx, object.Name); err != nil && !errors.Is(err, jetstream.ErrObjectNotFound) {
+		err := store.Delete(ctx, object.Name)
+		if err != nil && !errors.Is(err, jetstream.ErrObjectNotFound) {
 			return deleted, fmt.Errorf("delete runtime object %q: %w", object.Name, err)
+		}
+		if err == nil && len(telemetry) > 0 {
+			telemetry[0].CleanupDeleted.Add(ctx, 1)
 		}
 		deleted++
 	}
