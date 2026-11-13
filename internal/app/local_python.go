@@ -181,7 +181,7 @@ func RunLocalPythonExec(ctx context.Context, cfg LocalPythonConfig) (LocalPython
 	}, nil
 }
 
-func ensureLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths localPythonSnapshotFiles, stderr io.Writer) error {
+func ensureLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths localPythonSnapshotFiles, stderr io.Writer) (retErr error) {
 	check := localPythonSnapshotCheck(paths, cfg)
 	if check.OK {
 		return nil
@@ -221,7 +221,8 @@ func ensureLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths
 	}
 
 	apiSock := filepath.Join(workDir, "firecracker.socket")
-	cmd := exec.CommandContext(ctx, localPythonFirecrackerBinary(cfg), localPythonFirecrackerArgs(snapshotCfg, apiSock, configPath, filepath.Join(workDir, "firecracker.log"))...)
+	logPath := filepath.Join(workDir, "firecracker.log")
+	cmd := exec.CommandContext(ctx, localPythonFirecrackerBinary(cfg), localPythonFirecrackerArgs(snapshotCfg, apiSock, configPath, logPath)...)
 	extraFiles, closeExtraFiles, err := localPythonFirecrackerExtraFiles(snapshotCfg, paths.WorkspacePath, paths.SwapPath)
 	if err != nil {
 		return err
@@ -235,62 +236,58 @@ func ensureLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths
 	defer stdinRead.Close()
 	defer stdinWrite.Close()
 	cmd.Stdin = stdinRead
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("create snapshot stdout pipe: %w", err)
-	}
-	cmd.Stderr = localPythonFirecrackerStderr(snapshotCfg, stderr)
+	var output, processStderr localPythonStartupOutput
+	cmd.Stdout = &output
+	cmd.Stderr = &processStderr
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start firecracker for snapshot: %w", err)
 	}
-	waitDone := make(chan struct{})
-	var output bytes.Buffer
+	startupCtx, cancelStartup := context.WithCancelCause(ctx)
+	defer cancelStartup(nil)
+	processDone := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(&output, stdoutPipe)
-		close(waitDone)
+		err := cmd.Wait() // Also waits for stdout/stderr capture to finish.
+		if err == nil {
+			err = errors.New("unexpected clean exit")
+		}
+		cancelStartup(fmt.Errorf("firecracker snapshot process exited: %w", err))
+		close(processDone)
 	}()
-	if err := waitForUnixSocket(ctx, apiSock, 5*time.Second); err != nil {
+	defer func() {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		<-processDone
+		if retErr != nil {
+			// Keep startup diagnostics in the private error, not response log headers.
+			retErr = fmt.Errorf("%w; console: %s; firecracker stderr: %s; firecracker log: %s", retErr, output.String(), processStderr.String(), localPythonFirecrackerLogTail(logPath))
+		}
+	}()
+	if err := waitForUnixSocket(startupCtx, apiSock, 5*time.Second); err != nil {
 		return err
 	}
-	if err := waitForBuffer(ctx, &output, "python repl ready", 10*time.Second); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	if err := waitForBuffer(startupCtx, &output, "python repl ready", 10*time.Second); err != nil {
 		return fmt.Errorf("wait for python snapshot readiness: %w", err)
 	}
 	if _, err := io.WriteString(stdinWrite, localPythonPrepareSnapshotInput(cfg)); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
 		return fmt.Errorf("prepare snapshot guest: %w", err)
 	}
-	if err := waitForBuffer(ctx, &output, "__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__", 10*time.Second); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	if err := waitForBuffer(startupCtx, &output, "__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__", 10*time.Second); err != nil {
 		return fmt.Errorf("wait for snapshot guest readiness: %w", err)
 	}
-	if err := firecrackerAPIRequest(ctx, apiSock, http.MethodPatch, "/vm", map[string]string{"state": "Paused"}); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	if err := firecrackerAPIRequest(startupCtx, apiSock, http.MethodPatch, "/vm", map[string]string{"state": "Paused"}); err != nil {
 		return fmt.Errorf("pause snapshot VM: %w", err)
 	}
-	if err := firecrackerAPIRequest(ctx, apiSock, http.MethodPut, "/snapshot/create", map[string]string{
+	if err := firecrackerAPIRequest(startupCtx, apiSock, http.MethodPut, "/snapshot/create", map[string]string{
 		"snapshot_type": "Full",
 		"snapshot_path": paths.StatePath,
 		"mem_file_path": paths.MemoryPath,
 	}); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
 		return fmt.Errorf("create snapshot: %w", err)
 	}
-	_ = cmd.Process.Kill()
-	err = cmd.Wait()
-	<-waitDone
 	if !cfg.HideFirecrackerLog {
 		fmt.Fprintf(stderr, "python snapshot ready after %s\n", time.Since(startedAt).Round(time.Millisecond))
 	}
-	if err != nil && ctx.Err() != nil {
-		return fmt.Errorf("stop snapshot VM: %w", err)
+	if err := context.Cause(startupCtx); err != nil {
+		return fmt.Errorf("finish snapshot creation: %w", err)
 	}
 	if err := os.WriteFile(paths.VersionPath, []byte(localPythonSnapshotVersion(cfg)+"\n"), 0o644); err != nil {
 		return fmt.Errorf("write snapshot version: %w", err)
@@ -746,7 +743,7 @@ func runLocalPythonBenchmarkOnce(ctx context.Context, cfg LocalPythonConfig, pat
 		}
 	}()
 	waitDone := make(chan struct{})
-	var output bytes.Buffer
+	var output localPythonStartupOutput
 	go func() {
 		_, _ = io.Copy(&output, stdoutPipe)
 		close(waitDone)
@@ -794,7 +791,11 @@ func runLocalPythonBenchmarkOnce(ctx context.Context, cfg LocalPythonConfig, pat
 
 func localPythonSnapshotStdin(cfg LocalPythonConfig, execSource string, stdin io.Reader) io.Reader {
 	if execSource == "" {
-		return stdin
+		setup := strings.NewReader("exec(" + strconv.Quote("import subprocess\n"+localPythonWorkspaceSetup) + ")\n")
+		if stdin == nil {
+			return setup
+		}
+		return io.MultiReader(setup, stdin)
 	}
 	return strings.NewReader(localPythonExecInput(execSource, localPythonExecFilename(cfg), !cfg.SkipGuestWorkspaceSync))
 }
@@ -820,9 +821,17 @@ func localPythonExecFilename(cfg LocalPythonConfig) string {
 	return "<exec>"
 }
 
+// A snapshot must not retain a mounted, request-specific filesystem. Discard
+// block pages probed during cold boot before mounting the current image.
+const localPythonWorkspaceSetup = "subprocess.run(['/usr/sbin/blockdev', '--flushbufs', '/dev/vdb'], check=True)\n" +
+	"subprocess.run(['/usr/bin/mount', '-t', 'ext4', '/dev/vdb', '/workspace'], check=True)\n" +
+	"subprocess.run(['/usr/bin/chown', '-R', '65534:65534', '/workspace'], check=True)\n" +
+	"subprocess.run(['/usr/bin/chmod', '-R', 'u+rwX', '/workspace'], check=True)\n"
+
 func localPythonExecInput(source, filename string, syncWorkspace bool) string {
 	encoded := base64.StdEncoding.EncodeToString([]byte(source))
 	input := "import base64, os, subprocess\n" +
+		localPythonWorkspaceSetup +
 		"os.environ['HOME'] = '/workspace'\n" +
 		"os.environ['TMPDIR'] = '/workspace'\n" +
 		"os.chdir('/workspace')\n" +
@@ -839,23 +848,24 @@ func localPythonExecInput(source, filename string, syncWorkspace bool) string {
 		input += "    pass\n"
 	}
 	input += "\nraise SystemExit\n"
-	return input
+	// Setup errors must prevent privilege dropping and user-code execution.
+	return "exec(" + strconv.Quote(input) + ")\n"
 }
 
 func localPythonPrepareSnapshotInput(cfg LocalPythonConfig) string {
 	var builder strings.Builder
 	builder.WriteString("import os, subprocess\n")
-	builder.WriteString("os.makedirs('/workspace', exist_ok=True)\n")
-	builder.WriteString("subprocess.run(['/usr/bin/mount', '-t', 'ext4', '/dev/vdb', '/workspace'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
-	builder.WriteString("subprocess.run(['/usr/bin/chown', '-R', '65534:65534', '/workspace'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
-	builder.WriteString("subprocess.run(['/usr/bin/chmod', '-R', 'u+rwX', '/workspace'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
+	// Leave the workspace unmounted: each restore receives a rebuilt image,
+	// potentially for another thread, with its own UUID and filesystem metadata.
 	if cfg.SwapMiB > 0 {
 		builder.WriteString("subprocess.run(['/usr/sbin/mkswap', '/dev/vdc'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
 		builder.WriteString("subprocess.run(['/usr/sbin/swapon', '/dev/vdc'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
 	}
-	builder.WriteString("subprocess.run(['/usr/bin/mount', '-o', 'remount,ro', '/'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
-	builder.WriteString("print('__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__')\n")
-	return builder.String()
+	// Do not put the complete marker in serial input: the guest TTY can echo it
+	// before executing the block, which would report readiness before setup.
+	builder.WriteString("print('__NATS_' + 'SANDBOX_RUNTIME_SNAPSHOT_READY__', flush=True)\n")
+	// Execute one block: an earlier setup failure must prevent the ready marker.
+	return "exec(" + strconv.Quote(builder.String()) + ")\n"
 }
 
 func localPythonBenchmarkStats(runs []localPythonBenchmarkRun) localPythonBenchmarkResult {
@@ -1078,7 +1088,7 @@ func localPythonSnapshotVersion(cfg LocalPythonConfig) string {
 	if resolved, err := exec.LookPath(firecracker); err == nil {
 		firecracker = resolved
 	}
-	return fmt.Sprintf("workspace-v7 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 user_uid=65534 kernel=%s rootfs=%s firecracker=%s", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB, localPythonSnapshotAssetVersion(cfg.KernelPath), localPythonSnapshotRootfsVersion(cfg.RootfsPath), localPythonSnapshotAssetVersion(firecracker))
+	return fmt.Sprintf("workspace-v8 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 root_device_ro=1 workspace_mount=on_restore user_uid=65534 kernel=%s rootfs=%s firecracker=%s", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB, localPythonSnapshotAssetVersion(cfg.KernelPath), localPythonSnapshotRootfsVersion(cfg.RootfsPath), localPythonSnapshotAssetVersion(firecracker))
 }
 
 func localPythonSnapshotAssetVersion(path string) string {
@@ -1111,13 +1121,42 @@ func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) 
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
 }
 
-func waitForBuffer(ctx context.Context, buf *bytes.Buffer, needle string, timeout time.Duration) error {
+// Only the bounded tail is retained; both capture and readiness reads are concurrent.
+const localPythonStartupOutputLimit = 64 * 1024
+
+type localPythonStartupOutput struct {
+	mu   sync.Mutex
+	tail []byte
+}
+
+func (b *localPythonStartupOutput) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := len(p)
+	if n >= localPythonStartupOutputLimit {
+		b.tail = append(b.tail[:0], p[n-localPythonStartupOutputLimit:]...)
+	} else {
+		if excess := len(b.tail) + n - localPythonStartupOutputLimit; excess > 0 {
+			b.tail = b.tail[:copy(b.tail, b.tail[excess:])]
+		}
+		b.tail = append(b.tail, p...)
+	}
+	return n, nil
+}
+
+func (b *localPythonStartupOutput) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.tail)
+}
+
+func waitForBuffer(ctx context.Context, buf *localPythonStartupOutput, needle string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		if strings.Contains(buf.String(), needle) {
@@ -1128,7 +1167,7 @@ func waitForBuffer(ctx context.Context, buf *bytes.Buffer, needle string, timeou
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -1189,11 +1228,24 @@ func localPythonFirecrackerStderr(cfg LocalPythonConfig, stderr io.Writer) io.Wr
 }
 
 func writeLocalPythonFirecrackerLog(stderr io.Writer, logPath string) {
-	data, err := os.ReadFile(logPath)
-	if err != nil || strings.TrimSpace(string(data)) == "" {
+	data := localPythonFirecrackerLogTail(logPath)
+	if strings.TrimSpace(data) == "" {
 		return
 	}
 	fmt.Fprintf(stderr, "firecracker log:\n%s\n", data)
+}
+
+func localPythonFirecrackerLogTail(logPath string) string {
+	file, err := os.Open(logPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err == nil && info.Size() > localPythonStartupOutputLimit {
+		_, _ = file.Seek(-localPythonStartupOutputLimit, io.SeekEnd)
+	}
+	data, _ := io.ReadAll(io.LimitReader(file, localPythonStartupOutputLimit))
+	return string(data)
 }
 
 func localPythonProcessKilledHint(err error) string {
@@ -1247,7 +1299,7 @@ func localPythonVMConfig(cfg LocalPythonConfig, paths localPythonSnapshotFiles, 
 			DriveID:      "rootfs",
 			PathOnHost:   cfg.RootfsPath,
 			IsRootDevice: true,
-			IsReadOnly:   false,
+			IsReadOnly:   true,
 		},
 		{
 			DriveID:      "workspace",
@@ -1285,7 +1337,7 @@ func localPythonBootArgs(inlineCommand string, startUnixNano int64, hideLog bool
 		"panic=1",
 		"pci=off",
 		"root=/dev/vda",
-		"rw",
+		"ro",
 		"init=/usr/local/bin/fc-python-init",
 		fmt.Sprintf("fc_start_ns=%d", startUnixNano),
 	}

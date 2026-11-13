@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,7 +19,7 @@ import (
 func TestLocalPythonBootArgsStartInteractivePythonAsInit(t *testing.T) {
 	got := localPythonBootArgs("", 123, false)
 
-	want := "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/local/bin/fc-python-init fc_start_ns=123"
+	want := "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/usr/local/bin/fc-python-init fc_start_ns=123"
 	if got != want {
 		t.Fatalf("boot args = %q, want %q", got, want)
 	}
@@ -25,7 +28,7 @@ func TestLocalPythonBootArgsStartInteractivePythonAsInit(t *testing.T) {
 func TestLocalPythonBootArgsRunInlineCommand(t *testing.T) {
 	got := localPythonBootArgs(`print("hello")`, 456, false)
 
-	want := `console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/local/bin/fc-python-init fc_start_ns=456 fc_py_b64=cHJpbnQoImhlbGxvIik=`
+	want := `console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/usr/local/bin/fc-python-init fc_start_ns=456 fc_py_b64=cHJpbnQoImhlbGxvIik=`
 	if got != want {
 		t.Fatalf("boot args = %q, want %q", got, want)
 	}
@@ -60,6 +63,9 @@ func TestLocalPythonVMConfigUsesKernelRootfsAndMemory(t *testing.T) {
 	}
 	if got.Drives[0].PathOnHost != cfg.RootfsPath {
 		t.Fatalf("rootfs path = %q, want %q", got.Drives[0].PathOnHost, cfg.RootfsPath)
+	}
+	if !got.Drives[0].IsReadOnly || got.Drives[1].IsReadOnly || got.Drives[2].IsReadOnly {
+		t.Fatalf("drive access = %#v, want read-only rootfs and writable workspace/swap", got.Drives)
 	}
 	if got.Drives[1].DriveID != "workspace" {
 		t.Fatalf("workspace drive id = %q, want workspace", got.Drives[1].DriveID)
@@ -462,19 +468,160 @@ func TestInvalidateLocalPythonSnapshotRemovesStateMemoryAndVersion(t *testing.T)
 	}
 }
 
-func TestLocalPythonPrepareSnapshotInputMountsWorkspaceAndProtectsSystem(t *testing.T) {
+func TestLocalPythonPrepareSnapshotInputLeavesWorkspaceUnmounted(t *testing.T) {
 	got := localPythonPrepareSnapshotInput(LocalPythonConfig{SwapMiB: 64})
 
-	if !containsAll(got, "mount", "/dev/vdb", "/workspace", "mkswap", "swapon", "remount,ro", "__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__") {
-		t.Fatalf("prepare snapshot input = %q, want workspace mount, swap setup, and root remount before snapshot", got)
+	if !containsAll(got, "mkswap", "swapon", "/dev/vdc") || strings.Contains(got, "/dev/vdb") {
+		t.Fatalf("prepare snapshot input = %q, want swap setup and an unmounted workspace", got)
+	}
+	if strings.Contains(got, "__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__") {
+		t.Fatal("serial input contains the readiness marker before setup executes")
 	}
 }
 
-func TestLocalPythonPrepareSnapshotInputMakesWorkspaceTreeWritableByRunner(t *testing.T) {
-	got := localPythonPrepareSnapshotInput(LocalPythonConfig{})
+func TestLocalPythonPrepareSnapshotInputDoesNotReportSuccessAfterFailure(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is required to exercise the guest REPL")
+	}
+	for _, fail := range []bool{false, true} {
+		// Independent REPL lines continue after an exception; one exec block
+		// must prevent the marker on failure, but print it after successful setup.
+		mock := "None"
+		if fail {
+			mock = "(_ for _ in ()).throw(RuntimeError('mount failed'))"
+		}
+		input := "import os, subprocess\nos.makedirs = lambda *a, **kw: None\n" +
+			"subprocess.run = lambda *a, **kw: " + mock + "\n" +
+			localPythonPrepareSnapshotInput(LocalPythonConfig{SwapMiB: 64}) + "print('REPL_STILL_RUNNING')\n"
+		cmd := exec.CommandContext(t.Context(), python, "-i", "-q")
+		cmd.Stdin = strings.NewReader(input)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(output, []byte("REPL_STILL_RUNNING")) || (fail && !bytes.Contains(output, []byte("mount failed"))) {
+			t.Fatalf("did not exercise the REPL setup: %s", output)
+		}
+		if bytes.Contains(output, []byte("__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__")) == fail {
+			t.Fatalf("readiness mismatch (setup failure=%t): %s", fail, output)
+		}
+	}
+}
 
-	if !containsAll(got, "chown", "-R", "65534:65534", "/workspace") {
-		t.Fatalf("prepare snapshot input = %q, want recursive workspace ownership for runner", got)
+func TestLocalPythonSnapshotCheckRejectsWritableRootDeviceCache(t *testing.T) {
+	paths := localPythonSnapshotPaths(t.TempDir())
+	cfg := LocalPythonConfig{MemoryMiB: 128, VCPUs: 1, WorkspaceMiB: 16}
+	for _, path := range []string{paths.StatePath, paths.MemoryPath} {
+		if err := os.WriteFile(path, []byte("old cache"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldVersion := strings.Replace(localPythonSnapshotVersion(cfg), "workspace-v8", "workspace-v7", 1)
+	oldVersion = strings.Replace(oldVersion, " root_device_ro=1 workspace_mount=on_restore", "", 1)
+	if err := os.WriteFile(paths.VersionPath, []byte(oldVersion), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if check := localPythonSnapshotCheck(paths, cfg); check.OK {
+		t.Fatal("accepted a snapshot that restores a writable root device")
+	}
+}
+
+func TestLocalPythonStartupOutputConcurrentReadinessAndBoundedTail(t *testing.T) {
+	var output localPythonStartupOutput
+	var writers sync.WaitGroup
+	writers.Go(func() {
+		for range 1000 {
+			_, _ = output.Write([]byte("booting\n"))
+		}
+		_, _ = output.Write([]byte("python repl ready"))
+	})
+	err := waitForBuffer(t.Context(), &output, "python repl ready", time.Second)
+	writers.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = output.Write(bytes.Repeat([]byte("x"), 2*localPythonStartupOutputLimit))
+	_, _ = output.Write([]byte("last diagnostic"))
+	if got := output.String(); len(got) != localPythonStartupOutputLimit || !strings.HasSuffix(got, "last diagnostic") {
+		t.Fatalf("startup output tail: length=%d, suffix=%t", len(got), strings.HasSuffix(got, "last diagnostic"))
+	}
+}
+
+func TestLocalPythonStartupWaitReturnsCancellationCause(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("firecracker failed before readiness")
+	cancel(cause)
+	var output localPythonStartupOutput
+	if err := waitForBuffer(ctx, &output, "ready", time.Second); !errors.Is(err, cause) {
+		t.Fatalf("wait error = %v, want process failure", err)
+	}
+	if err := waitForUnixSocket(ctx, filepath.Join(t.TempDir(), "missing.socket"), time.Second); !errors.Is(err, cause) {
+		t.Fatalf("socket wait error = %v, want process failure", err)
+	}
+}
+
+func TestLocalPythonSnapshotStartupReapsProcessAndKeepsDiagnosticsPrivate(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancel), func(t *testing.T) {
+			dir := t.TempDir()
+			binary := filepath.Join(dir, "firecracker")
+			script := "#!/bin/sh\nprintf 'private console failure'\nprintf 'private stderr failure' >&2\nexit 23\n"
+			if cancel {
+				script = "#!/bin/sh\nprintf 'waiting for cancellation' >&2\nexec sleep 30\n"
+			}
+			if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cfg := LocalPythonConfig{FirecrackerPath: binary, SnapshotDir: dir, HideFirecrackerLog: true}
+			paths := localPythonSnapshotPaths(dir)
+			if err := os.WriteFile(paths.WorkspacePath, []byte("workspace"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			ctx, stop := context.WithTimeout(t.Context(), time.Second)
+			defer stop()
+			var responseStderr bytes.Buffer
+			started := time.Now()
+			err := ensureLocalPythonSnapshot(ctx, cfg, paths, &responseStderr)
+			if cancel {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("error = %v, want cancellation", err)
+				}
+			} else if err == nil || !containsAll(err.Error(), "exit status 23", "private console failure", "private stderr failure") {
+				t.Fatalf("error = %v, want captured process failure", err)
+			}
+			if time.Since(started) > 3*time.Second {
+				t.Fatal("startup waited for the readiness timeout after exit/cancellation")
+			}
+			if responseStderr.Len() != 0 {
+				t.Fatalf("private startup diagnostics leaked into response stderr: %s", responseStderr.String())
+			}
+			if _, err := os.Stat(paths.VersionPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("failed startup left a cache version: %v", err)
+			}
+		})
+	}
+}
+
+func TestLocalPythonExecInputMountsCurrentWorkspaceAndMakesTreeWritableByRunner(t *testing.T) {
+	got := localPythonExecInput("pass", "<exec>", false)
+
+	if !containsAll(got, "--flushbufs", "/dev/vdb", "/usr/bin/mount", "chown", "-R", "65534:65534", "/workspace") {
+		t.Fatalf("exec input = %q, want current workspace mounted and writable by runner", got)
+	}
+}
+
+func TestLocalPythonSnapshotStdinMountsWorkspaceBeforeInteractiveInput(t *testing.T) {
+	command := "print('interactive command')\n"
+	input, err := io.ReadAll(localPythonSnapshotStdin(LocalPythonConfig{}, "", strings.NewReader(command)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsAll(string(input), "--flushbufs", "/usr/bin/mount", "/workspace") || !strings.HasSuffix(string(input), command) {
+		t.Fatalf("interactive input = %q, want workspace setup before user input", input)
+	}
+	if bytes.Contains(input, []byte("raise SystemExit")) {
+		t.Fatal("workspace setup closes the interactive session")
 	}
 }
 
@@ -484,8 +631,30 @@ func TestLocalPythonExecInputRunsUserCodeUnprivileged(t *testing.T) {
 	if !containsAll(got, "os.setgid(65534)", "os.setuid(65534)", "os.chdir('/workspace')", "compile(") {
 		t.Fatalf("exec input = %q, want user code to run unprivileged from workspace", got)
 	}
-	if strings.Contains(got, "mkswap") || strings.Contains(got, "swapon") || strings.Contains(got, "/usr/bin/mount") {
-		t.Fatalf("exec input = %q, want no privileged guest setup in user-code wrapper", got)
+	if strings.Contains(got, "mkswap") || strings.Contains(got, "swapon") {
+		t.Fatalf("exec input = %q, want swap already prepared in the snapshot", got)
+	}
+	if strings.Index(got, "/usr/bin/mount") > strings.Index(got, "os.setuid(65534)") {
+		t.Fatal("workspace must be mounted before dropping privileges")
+	}
+}
+
+func TestLocalPythonExecInputDoesNotRunUserCodeAfterSetupFailure(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is required to exercise the guest REPL")
+	}
+	input := "import os, subprocess\n" +
+		"subprocess.run = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('workspace setup failed'))\n" +
+		localPythonExecInput("print('USER_CODE_EXECUTED')", "<exec>", false)
+	cmd := exec.CommandContext(t.Context(), python, "-i", "-q")
+	cmd.Stdin = strings.NewReader(input)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(output, []byte("workspace setup failed")) || bytes.Contains(output, []byte("USER_CODE_EXECUTED")) {
+		t.Fatalf("user-code execution was not stopped after setup failed: %s", output)
 	}
 }
 
