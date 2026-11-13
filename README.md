@@ -482,6 +482,17 @@ Useful flags include:
 - `--runs`
 - `--parallel-runs`
 
+The packaged guest root disk is read-only from cold boot onward. `/workspace`
+is created during the image build and mounted from a separate writable disk;
+custom rootfs images must also include that directory. This avoids copying the
+large root disk into a fresh container's writable layer on its first request.
+Snapshots leave the workspace unmounted. Each restored VM discards cached
+workspace block pages and mounts the current request's disk before dropping
+privileges, so filesystem metadata from a previous image is not reused.
+Roll out the rebuilt image with its guest assets, rather than replacing only the
+runtime binary in an older image. Snapshots made with a writable root device are
+automatically invalidated; thread workspaces are preserved.
+
 Snapshot caches are rebuilt when resource settings, kernel/Firecracker file
 metadata, or the rootfs path, size, or packaged build checksum changes. Docker
 images include `rootfs.ext4.sha256`; its build checksum remains stable across guest

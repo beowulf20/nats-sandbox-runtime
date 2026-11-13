@@ -74,6 +74,7 @@ RUN set -eu; \
 
 RUN set -eu; \
 	install -m 0755 /tmp/fc-python-init /tmp/rootfs/usr/local/bin/fc-python-init; \
+	mkdir -p /tmp/rootfs/workspace; \
 	truncate -s "${GUEST_ROOTFS_SIZE}" /out/rootfs.ext4; \
 	mkfs.ext4 -q -d /tmp/rootfs /out/rootfs.ext4; \
 	sha256sum /out/rootfs.ext4 > /out/rootfs.ext4.sha256; \
