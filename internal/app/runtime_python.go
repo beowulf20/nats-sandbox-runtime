@@ -118,6 +118,7 @@ type runtimePythonRegistration struct {
 
 func (r *runtimePythonRegistration) Close() {
 	r.closeOnce.Do(func() {
+		closeDeadline := time.Now().Add(35 * time.Second)
 		if r.runtime != nil {
 			r.runtime.drain(30*time.Second, 5*time.Second)
 		}
@@ -131,7 +132,9 @@ func (r *runtimePythonRegistration) Close() {
 			_ = r.service.Stop()
 		}
 		if r.conn != nil {
-			_ = r.conn.FlushTimeout(time.Second)
+			if remaining := min(time.Second, time.Until(closeDeadline)); remaining > 0 {
+				_ = r.conn.FlushTimeout(remaining)
+			}
 			r.conn.Close()
 		}
 	})
@@ -685,6 +688,7 @@ func uploadRuntimeArtifacts(ctx context.Context, store jetstream.ObjectStore, ru
 		if err != nil {
 			return fmt.Errorf("open artifact %q: %w", rel, err)
 		}
+		defer file.Close()
 		info, err := store.Put(ctx, jetstream.ObjectMeta{Name: objectName}, file)
 		closeErr := file.Close()
 		if err != nil {
