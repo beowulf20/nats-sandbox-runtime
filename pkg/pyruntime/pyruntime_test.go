@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/nats-io/nats.go"
@@ -94,6 +96,9 @@ func TestRunUploadsInputsAndSendsRuntimeWireRequest(t *testing.T) {
 			if req.ThreadID != "thread-a" || req.Code != "print('hi')" {
 				t.Fatalf("request = %#v, want thread/code", req)
 			}
+			if !reflect.DeepEqual(req.ArtifactExcludePrefixes, []string{"artifacts/"}) {
+				t.Fatalf("exclusions=%v", req.ArtifactExcludePrefixes)
+			}
 			wantInputs := []pythonRunObjectMapping{
 				{Object: "sdk-inputs/" + req.RunID + "/a.txt", Path: "a.txt"},
 				{Object: "sdk-inputs/" + req.RunID + "/nested/b.txt", Path: "nested/b.txt"},
@@ -107,8 +112,9 @@ func TestRunUploadsInputsAndSendsRuntimeWireRequest(t *testing.T) {
 	client := &Client{req: requester, store: store, cfg: withDefaults(Config{})}
 
 	result, err := client.Run(t.Context(), Request{
-		ThreadID: "thread-a",
-		Code:     "print('hi')",
+		ThreadID:                "thread-a",
+		Code:                    "print('hi')",
+		ArtifactExcludePrefixes: []string{"artifacts/"},
 		Files: map[string][]byte{
 			"nested/b.txt": []byte("b"),
 			"a.txt":        []byte("a"),
@@ -123,8 +129,24 @@ func TestRunUploadsInputsAndSendsRuntimeWireRequest(t *testing.T) {
 	if len(store.puts) != 2 {
 		t.Fatalf("puts = %#v, want two uploads", store.puts)
 	}
+	sort.Strings(store.puts)
 	if !strings.HasSuffix(store.puts[0], "/a.txt") || !strings.HasSuffix(store.puts[1], "/nested/b.txt") {
-		t.Fatalf("puts = %#v, want deterministic sorted input uploads", store.puts)
+		t.Fatalf("puts = %#v, want both input uploads", store.puts)
+	}
+}
+
+func TestExclusionValidationAndConcurrentActualTotal(t *testing.T) {
+	c := newTestClient(Config{})
+	_, err := c.Run(t.Context(), Request{ThreadID: "thread", Code: "fixture", ArtifactExcludePrefixes: []string{"../escape"}, Files: map[string][]byte{"a": {1}}})
+	if err == nil || len(c.store.(*fakeStore).puts) != 0 {
+		t.Fatalf("invalid exclusion uploaded inputs: err=%v", err)
+	}
+	store := newFakeStore()
+	store.objects["a"], store.objects["b"] = []byte("abc"), []byte("def")
+	files, err := downloadArtifacts(t.Context(), store, []pythonRunArtifact{{Path: "a", Object: "a", Size: 1}, {Path: "b", Object: "b", Size: 1}}, withDefaults(Config{MaxOutputFileBytes: 4, MaxOutputTotalBytes: 5}))
+	var limit SizeLimitError
+	if !errors.As(err, &limit) || limit.Kind != "output_total" || limit.Size != 6 || files != nil {
+		t.Fatalf("files=%v err=%v", files, err)
 	}
 }
 
@@ -293,6 +315,7 @@ func (r *fakeRequester) RequestWithContext(_ context.Context, subject string, da
 }
 
 type fakeStore struct {
+	mu      sync.Mutex
 	objects map[string][]byte
 	puts    []string
 	gets    []string
@@ -304,12 +327,16 @@ func newFakeStore() *fakeStore {
 }
 
 func (s *fakeStore) PutBytes(_ context.Context, name string, data []byte) (*jetstream.ObjectInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.puts = append(s.puts, name)
 	s.objects[name] = append([]byte(nil), data...)
 	return nil, nil
 }
 
 func (s *fakeStore) GetBytes(_ context.Context, name string, _ ...jetstream.GetObjectOpt) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.gets = append(s.gets, name)
 	if s.getErr != nil {
 		return nil, s.getErr

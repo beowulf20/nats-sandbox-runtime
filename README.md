@@ -245,11 +245,21 @@ $JS.API.CONSUMER.DELETE.OBJ_python-runtime-workspaces.>
 
 ## Scaling Warning
 
+Within one service instance, each accepted request reserves a worker before background dispatch. Distinct threads can execute concurrently; requests for the same thread serialize on a cancellable workspace lock and still occupy a worker. When the pool is full, being resized below current usage, or shutting down, new requests receive an immediate service error `503`; no execution queue is created.
+
+Normal shutdown closes admission and keeps NATS available for replies for up to 30 seconds. Remaining jobs are cancelled, with up to 5 seconds for cleanup before closing the connection. Re-registration joins the previous generation before starting another. The stack manifest uses `stop_grace_period: 45s` to cover draining and telemetry flush. Deployment changes remain manual; measure memory with concurrent KVM executions before increasing workers or rolling out.
+
+Native `$SRV.STATS` processing times measure callback dispatch, not background execution. The `run` endpoint also returns `data.execution` with `completed` (accepted jobs finished, including failures), `errors` (failed jobs or reply attempts), `rejected_busy`, `in_flight`, `processing_time_ns`, and `average_processing_time_ns`. Execution timing includes workspace waits and the reply attempt; OTEL request spans cover the same lifetime. These additional counters accumulate per service registration and are not cleared by the native stats reset.
+
 NATS load-balances requests across service instances that subscribe to the same `python.run` subject. The runtime does not currently share live workspace images between service instances.
 
 That means `thread_id` workspace persistence is local to the service instance that handled the earlier request. If a later request with the same `thread_id` lands on a different service instance, that instance cannot reuse or exchange the first instance's workspace image. Run a single runtime service instance when thread workspace continuity matters, or treat multiple instances as independent sandbox pools until workspace exchange is implemented.
 
 ## NATS Request Examples
+
+Requests may include `"artifact_exclude_prefixes": ["artifacts/"]` to omit an input directory from the returned artifacts. The Go SDK exposes the same option as `Request.ArtifactExcludePrefixes`. Missing or empty selection preserves full workspace export. Prefixes must be safe relative paths (no absolute paths, traversal, backslashes, or empty components). Matching is by path component: `artifacts/` excludes that directory and its children, but preserves `artifacts-other/`. Excluded directories are skipped before opening or publishing files; the response format is unchanged.
+
+Runtime fetches/publications and SDK uploads/downloads share a limit of four concurrent transfers per process. Manifests stay sorted regardless of completion order. On failure, pending transfers are cancelled and started transfers joined; no partial successful result is returned. Already published objects remain subject to normal retention.
 
 Run a simple inline script:
 

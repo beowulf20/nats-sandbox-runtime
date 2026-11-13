@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"nats-sandbox-runtime/internal/observability"
+	"nats-sandbox-runtime/internal/transfer"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -42,15 +43,16 @@ const (
 )
 
 type PythonRunRequest struct {
-	RunID        string                   `json:"run_id,omitempty"`
-	ThreadID     string                   `json:"thread_id,omitempty"`
-	Code         string                   `json:"code,omitempty"`
-	CodeObject   string                   `json:"code_object,omitempty"`
-	Inputs       []PythonRunObjectMapping `json:"inputs,omitempty"`
-	MemoryMiB    int64                    `json:"memory_mib,omitempty"`
-	SwapMiB      int64                    `json:"swap_mib,omitempty"`
-	WorkspaceMiB int64                    `json:"workspace_mib,omitempty"`
-	ExecTimeout  string                   `json:"exec_timeout,omitempty"`
+	ArtifactExcludePrefixes []string                 `json:"artifact_exclude_prefixes,omitempty"`
+	RunID                   string                   `json:"run_id,omitempty"`
+	ThreadID                string                   `json:"thread_id,omitempty"`
+	Code                    string                   `json:"code,omitempty"`
+	CodeObject              string                   `json:"code_object,omitempty"`
+	Inputs                  []PythonRunObjectMapping `json:"inputs,omitempty"`
+	MemoryMiB               int64                    `json:"memory_mib,omitempty"`
+	SwapMiB                 int64                    `json:"swap_mib,omitempty"`
+	WorkspaceMiB            int64                    `json:"workspace_mib,omitempty"`
+	ExecTimeout             string                   `json:"exec_timeout,omitempty"`
 }
 
 type PythonRunObjectMapping struct {
@@ -82,6 +84,12 @@ type PythonRunArtifact struct {
 }
 
 type runtimePythonService struct {
+	mu           sync.Mutex
+	jobs         sync.WaitGroup
+	stopping     bool
+	jobContext   context.Context
+	cancelJobs   context.CancelFunc
+	stats        runtimeExecutionStats
 	cfg          RuntimePythonConfig
 	store        jetstream.ObjectStore
 	controlPlane *RuntimeControlPlane
@@ -110,6 +118,10 @@ type runtimePythonRegistration struct {
 
 func (r *runtimePythonRegistration) Close() {
 	r.closeOnce.Do(func() {
+		closeDeadline := time.Now().Add(35 * time.Second)
+		if r.runtime != nil {
+			r.runtime.drain(30*time.Second, 5*time.Second)
+		}
 		if r.workers != nil {
 			_ = r.workers.Unregister()
 		}
@@ -120,6 +132,9 @@ func (r *runtimePythonRegistration) Close() {
 			_ = r.service.Stop()
 		}
 		if r.conn != nil {
+			if remaining := min(time.Second, time.Until(closeDeadline)); remaining > 0 {
+				_ = r.conn.FlushTimeout(remaining)
+			}
 			r.conn.Close()
 		}
 	})
@@ -153,6 +168,9 @@ func runRuntimePythonSupervisor(ctx context.Context, cfg RuntimePythonConfig, ou
 			return nil
 		case <-registration.closed:
 			registration.Close()
+			if registration.runtime != nil {
+				registration.runtime.jobs.Wait()
+			}
 			runtimeTelemetry(cfg).Logger.WarnContext(ctx, "runtime registration closed", "event", "runtime.registration.closed", "retry_ms", retryDelay.Milliseconds())
 			if !sleepRuntimePythonRetry(ctx, retryDelay) {
 				return nil
@@ -185,7 +203,9 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 	if err := validateLocalPythonConfig(cfg.LocalPython); err != nil {
 		return nil, err
 	}
-	registrationCtx, cancelRegistration := context.WithCancel(ctx)
+	// The supervisor owns cancellation: accepted work survives a normal signal
+	// until the drain deadline, while the connection remains available for replies.
+	registrationCtx, cancelRegistration := context.WithCancel(context.WithoutCancel(ctx))
 	closedCh := make(chan struct{})
 	var closeOnce sync.Once
 	telemetry := runtimeTelemetry(cfg)
@@ -233,6 +253,8 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		return nil, err
 	}
 	runtime := &runtimePythonService{
+		jobContext:   registrationCtx,
+		cancelJobs:   cancelRegistration,
 		cfg:          cfg,
 		store:        store,
 		controlPlane: controlPlane,
@@ -240,16 +262,17 @@ func startRuntimePythonService(ctx context.Context, cfg RuntimePythonConfig, con
 		workspaces:   NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir),
 	}
 	srv, err := micro.AddService(nc, micro.Config{
-		Name:        runtimePythonServiceName,
-		Version:     runtimePythonServiceVersion,
-		Description: runtimePythonServiceDescription,
+		Name:         runtimePythonServiceName,
+		Version:      runtimePythonServiceVersion,
+		Description:  runtimePythonServiceDescription,
+		StatsHandler: runtime.executionStats,
 	})
 	if err != nil {
 		cancelRegistration()
 		nc.Close()
 		return nil, fmt.Errorf("add runtime service: %w", err)
 	}
-	if err := srv.AddEndpoint("run", observeMicroRequest(telemetry, runtimePythonEndpointSubject, runtime.handleRun), micro.WithEndpointSubject(runtimePythonEndpointSubject)); err != nil {
+	if err := srv.AddEndpoint("run", micro.HandlerFunc(runtime.dispatchRun), micro.WithEndpointSubject(runtimePythonEndpointSubject)); err != nil {
 		cancelRegistration()
 		_ = srv.Stop()
 		nc.Close()
@@ -294,37 +317,92 @@ func registerRuntimePythonControlPlaneEndpoints(srv micro.Service, runtime *runt
 }
 
 func (s *runtimePythonService) handleRun(ctx context.Context, req micro.Request) {
+	worker, ok := s.admit()
+	if !ok {
+		_ = req.Error("503", "python runtime is busy", nil)
+		return
+	}
+	defer s.jobs.Done()
+	s.handleAccepted(ctx, req, worker)
+}
+
+func (s *runtimePythonService) handleAccepted(ctx context.Context, req micro.Request, worker RuntimeWorker) {
+	defer s.workerPool.ReleaseWorker(worker.ID)
+	started := time.Now()
+	failed := false
+	attempted := false
+	defer func() {
+		if cause := recover(); cause != nil {
+			failed = true
+			runtimeTelemetry(s.cfg).Logger.ErrorContext(ctx, "runtime panic", "cause", fmt.Sprint(cause), "worker_id", worker.ID)
+			if !attempted {
+				attempted = true
+				_ = req.Error("500", "python runtime execution failed", nil)
+			}
+		}
+		s.mu.Lock()
+		s.stats.InFlight--
+		s.stats.Completed++
+		if failed {
+			s.stats.Errors++
+		}
+		s.stats.ProcessingTimeNS += time.Since(started).Nanoseconds()
+		s.mu.Unlock()
+	}()
+	var runReq PythonRunRequest
+	if len(req.Data()) > 0 {
+		if err := json.Unmarshal(req.Data(), &runReq); err != nil {
+			failed = true
+			attempted = true
+			_ = req.Error("400", "invalid python run request", nil)
+			return
+		}
+	}
+	if _, err := transfer.Prefixes(runReq.ArtifactExcludePrefixes); err != nil {
+		failed = true
+		attempted = true
+		_ = req.Error("400", "invalid artifact exclusion prefixes", nil)
+		return
+	}
+	if runReq.RunID == "" {
+		runReq.RunID = nats.NewInbox()[5:]
+	}
+	resp, stdout, stderr, err := s.run(ctx, worker, runReq)
+	if err != nil {
+		failed = true
+		runtimeTelemetry(s.cfg).Logger.ErrorContext(ctx, "runtime execution failed", "error", err, "run_id", runReq.RunID, "thread_id", runReq.ThreadID, "worker_id", worker.ID)
+		attempted = true
+		_ = req.Error("500", "python runtime execution failed", nil, micro.WithHeaders(micro.Headers(s.logHeaders(stdout, stderr))))
+		return
+	}
+	attempted = true
+	failed = req.RespondJSON(resp, micro.WithHeaders(micro.Headers(s.logHeaders(stdout, stderr)))) != nil
+}
+
+func (s *runtimePythonService) admit() (RuntimeWorker, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopping {
+		s.stats.RejectedBusy++
+		return RuntimeWorker{}, false
+	}
 	workerPool := s.workerPool
 	if workerPool == nil {
 		var err error
 		workerPool, err = NewRuntimeWorkerPool(s.cfg)
 		if err != nil {
-			_ = req.Error("500", err.Error(), nil)
-			return
+			return RuntimeWorker{}, false
 		}
 		s.workerPool = workerPool
 	}
 	worker, ok := workerPool.AcquireWorker()
 	if !ok {
-		_ = req.Error("503", "python runtime is busy", nil)
-		return
+		s.stats.RejectedBusy++
+		return RuntimeWorker{}, false
 	}
-	defer workerPool.ReleaseWorker(worker.ID)
-	var runReq PythonRunRequest
-	if len(req.Data()) > 0 {
-		if err := json.Unmarshal(req.Data(), &runReq); err != nil {
-			_ = req.Error("400", "invalid python run request", []byte(err.Error()))
-			return
-		}
-	}
-	resp, stdout, stderr, err := s.run(ctx, worker, runReq)
-	if err != nil {
-		headers := s.logHeaders(stdout, stderr)
-		_ = req.Error("500", err.Error(), nil, micro.WithHeaders(micro.Headers(headers)))
-		return
-	}
-	headers := s.logHeaders(stdout, stderr)
-	_ = req.RespondJSON(resp, micro.WithHeaders(micro.Headers(headers)))
+	s.jobs.Add(1)
+	s.stats.InFlight++
+	return worker, true
 }
 
 func (s *runtimePythonService) run(ctx context.Context, worker RuntimeWorker, runReq PythonRunRequest) (_ PythonRunResponse, _ []byte, _ []byte, err error) {
@@ -352,7 +430,7 @@ func (s *runtimePythonService) run(ctx context.Context, worker RuntimeWorker, ru
 		telemetry.RunDuration.Record(parentCtx, time.Since(start).Seconds(), attrs)
 		telemetry.Logger.Log(parentCtx, level, "runtime run completed", "event", "runtime.run.completed", "run_id", runID, "thread_id", runReq.ThreadID, "worker_id", worker.ID, "result", result, "duration_ms", float64(time.Since(start))/float64(time.Millisecond))
 	}()
-	workspaceLease, err := s.workspaceLeaseForRun(runReq, runID)
+	workspaceLease, err := s.workspaceLeaseForRunContext(ctx, runReq, runID)
 	if err != nil {
 		return PythonRunResponse{}, nil, nil, err
 	}
@@ -379,14 +457,32 @@ func (s *runtimePythonService) run(ctx context.Context, worker RuntimeWorker, ru
 			return PythonRunResponse{}, nil, nil, fmt.Errorf("stat workspace %q: %w", workspaceLease.Key, err)
 		}
 	}
+	// Reject aliases and overlapping destinations before concurrent writes.
+	seen := map[string]bool{}
 	for _, input := range runReq.Inputs {
-		if err := fetchRuntimeObject(ctx, s.store, workspaceDir, input); err != nil {
-			return PythonRunResponse{}, nil, nil, err
+		p, e := cleanWorkspaceRelativePath(input.Path)
+		if e != nil {
+			return PythonRunResponse{}, nil, nil, e
 		}
+		for other := range seen {
+			if p == other || strings.HasPrefix(p, other+"/") || strings.HasPrefix(other, p+"/") {
+				return PythonRunResponse{}, nil, nil, fmt.Errorf("overlapping input path %q", p)
+			}
+		}
+		seen[p] = true
+	}
+	if err := transfer.Parallel(ctx, len(runReq.Inputs), func(ctx context.Context, i int) error {
+		return fetchRuntimeObject(ctx, s.store, workspaceDir, runReq.Inputs[i])
+	}); err != nil {
+		return PythonRunResponse{}, nil, nil, err
 	}
 	code := runReq.Code
 	if runReq.CodeObject != "" {
-		code, err = s.store.GetString(ctx, runReq.CodeObject)
+		err = transfer.Parallel(ctx, 1, func(ctx context.Context, _ int) error {
+			var fetchErr error
+			code, fetchErr = s.store.GetString(ctx, runReq.CodeObject)
+			return fetchErr
+		})
 		if err != nil {
 			return PythonRunResponse{}, nil, nil, fmt.Errorf("fetch code object %q: %w", runReq.CodeObject, err)
 		}
@@ -411,14 +507,21 @@ func (s *runtimePythonService) run(ctx context.Context, worker RuntimeWorker, ru
 	if execute == nil {
 		execute = RunLocalPythonExec
 	}
-	result, err := execute(executeCtx, cfg)
-	endRuntimeSpan(executeSpan, err, "execution_failure")
+	result, err := func() (result LocalPythonExecResult, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("execution panic: %v", p)
+			}
+			endRuntimeSpan(executeSpan, err, "execution_failure")
+		}()
+		return execute(executeCtx, cfg)
+	}()
 	stdout := extractRuntimePythonStdout(result.Stdout, startMarker, endMarker)
 	if err != nil {
 		return PythonRunResponse{}, stdout, result.Stderr, err
 	}
 	uploadCtx, uploadSpan := telemetry.Tracer.Start(parentCtx, "runtime.upload", trace.WithAttributes(ids...))
-	artifacts, err := uploadRuntimeArtifacts(uploadCtx, s.store, runID, workspaceDir)
+	artifacts, err := uploadRuntimeArtifacts(uploadCtx, s.store, runID, workspaceDir, runReq.ArtifactExcludePrefixes...)
 	endRuntimeSpan(uploadSpan, err, "upload_failure")
 	if err != nil {
 		return PythonRunResponse{}, stdout, result.Stderr, err
@@ -446,18 +549,21 @@ func runtimeWorkspaceKey(runReq PythonRunRequest, runID string) string {
 }
 
 func (s *runtimePythonService) workspaceLeaseForRun(runReq PythonRunRequest, runID string) (RuntimeWorkspaceLease, error) {
+	return s.workspaceLeaseForRunContext(context.Background(), runReq, runID)
+}
+
+func (s *runtimePythonService) workspaceLeaseForRunContext(ctx context.Context, runReq PythonRunRequest, runID string) (RuntimeWorkspaceLease, error) {
 	key := runtimeWorkspaceKey(runReq, runID)
 	if key == "" {
 		return RuntimeWorkspaceLease{}, nil
 	}
-	return s.workspaceLease(key)
-}
-
-func (s *runtimePythonService) workspaceLease(key string) (RuntimeWorkspaceLease, error) {
+	s.mu.Lock()
 	if s.workspaces == nil {
 		s.workspaces = NewRuntimeWorkspaceManager(s.cfg.LocalPython.SnapshotDir)
 	}
-	return s.workspaces.Begin(key)
+	m := s.workspaces
+	s.mu.Unlock()
+	return m.BeginContext(ctx, key)
 }
 
 func (s *runtimePythonService) localPythonConfigForRun(worker RuntimeWorker, runReq PythonRunRequest, workDir, workspaceDir, workspaceImagePath, code string) (LocalPythonConfig, error) {
@@ -538,11 +644,26 @@ func fetchRuntimeObject(ctx context.Context, store jetstream.ObjectStore, worksp
 	return nil
 }
 
-func uploadRuntimeArtifacts(ctx context.Context, store jetstream.ObjectStore, runID, workspaceDir string) ([]PythonRunArtifact, error) {
-	var artifacts []PythonRunArtifact
-	err := filepath.WalkDir(workspaceDir, func(path string, entry fs.DirEntry, err error) error {
+func uploadRuntimeArtifacts(ctx context.Context, store jetstream.ObjectStore, runID, workspaceDir string, exclude ...string) ([]PythonRunArtifact, error) {
+	prefixes, err := transfer.Prefixes(exclude)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	err = filepath.WalkDir(workspaceDir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		rel, err := filepath.Rel(workspaceDir, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if transfer.Excluded(rel, prefixes) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if entry.IsDir() {
 			if entry.Name() == "lost+found" {
@@ -553,16 +674,21 @@ func uploadRuntimeArtifacts(ctx context.Context, store jetstream.ObjectStore, ru
 		if !entry.Type().IsRegular() {
 			return nil
 		}
-		rel, err := filepath.Rel(workspaceDir, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
+		paths = append(paths, rel)
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walk runtime workspace: %w", err)
+	}
+	artifacts := make([]PythonRunArtifact, len(paths))
+	err = transfer.Parallel(ctx, len(paths), func(ctx context.Context, i int) error {
+		rel := paths[i]
 		objectName := "runs/" + runID + "/artifacts/" + rel
-		file, err := os.Open(path)
+		file, err := os.Open(filepath.Join(workspaceDir, filepath.FromSlash(rel)))
 		if err != nil {
 			return fmt.Errorf("open artifact %q: %w", rel, err)
 		}
+		defer file.Close()
 		info, err := store.Put(ctx, jetstream.ObjectMeta{Name: objectName}, file)
 		closeErr := file.Close()
 		if err != nil {
@@ -571,12 +697,12 @@ func uploadRuntimeArtifacts(ctx context.Context, store jetstream.ObjectStore, ru
 		if closeErr != nil {
 			return fmt.Errorf("close artifact %q: %w", rel, closeErr)
 		}
-		artifacts = append(artifacts, PythonRunArtifact{
+		artifacts[i] = PythonRunArtifact{
 			Path:   rel,
 			Object: info.Name,
 			Size:   info.Size,
 			Digest: info.Digest,
-		})
+		}
 		return nil
 	})
 	if err != nil {
