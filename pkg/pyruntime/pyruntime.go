@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"nats-sandbox-runtime/internal/transfer"
 	"path"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -49,9 +51,10 @@ type Client struct {
 
 // Request is the V0 byte-only runtime request.
 type Request struct {
-	ThreadID string
-	Code     string
-	Files    map[string][]byte
+	ArtifactExcludePrefixes []string
+	ThreadID                string
+	Code                    string
+	Files                   map[string][]byte
 }
 
 // Result contains runtime logs and all workspace artifacts downloaded into memory.
@@ -127,25 +130,34 @@ func (c *Client) Run(ctx context.Context, req Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if _, err := transfer.Prefixes(req.ArtifactExcludePrefixes); err != nil {
+		return nil, err
+	}
 
 	runID := newRunID()
-	inputs := make([]pythonRunObjectMapping, 0, len(files))
-	for _, file := range files {
+	inputs := make([]pythonRunObjectMapping, len(files))
+	err = transfer.Parallel(ctx, len(files), func(ctx context.Context, i int) error {
+		file := files[i]
 		objectName := "sdk-inputs/" + runID + "/" + file.path
 		if _, err := c.store.PutBytes(ctx, objectName, file.data); err != nil {
-			return nil, fmt.Errorf("upload input %q: %w", file.path, err)
+			return fmt.Errorf("upload input %q: %w", file.path, err)
 		}
-		inputs = append(inputs, pythonRunObjectMapping{
+		inputs[i] = pythonRunObjectMapping{
 			Object: objectName,
 			Path:   file.path,
-		})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	wireReq := pythonRunRequest{
-		RunID:    runID,
-		ThreadID: strings.TrimSpace(req.ThreadID),
-		Code:     req.Code,
-		Inputs:   inputs,
+		ArtifactExcludePrefixes: req.ArtifactExcludePrefixes,
+		RunID:                   runID,
+		ThreadID:                strings.TrimSpace(req.ThreadID),
+		Code:                    req.Code,
+		Inputs:                  inputs,
 	}
 	data, err := json.Marshal(wireReq)
 	if err != nil {
@@ -193,10 +205,11 @@ type objectStore interface {
 }
 
 type pythonRunRequest struct {
-	RunID    string                   `json:"run_id"`
-	ThreadID string                   `json:"thread_id"`
-	Code     string                   `json:"code"`
-	Inputs   []pythonRunObjectMapping `json:"inputs,omitempty"`
+	ArtifactExcludePrefixes []string                 `json:"artifact_exclude_prefixes,omitempty"`
+	RunID                   string                   `json:"run_id"`
+	ThreadID                string                   `json:"thread_id"`
+	Code                    string                   `json:"code"`
+	Inputs                  []pythonRunObjectMapping `json:"inputs,omitempty"`
 }
 
 type pythonRunObjectMapping struct {
@@ -292,9 +305,15 @@ func downloadArtifacts(ctx context.Context, store objectStore, artifacts []pytho
 		if err != nil {
 			return nil, fmt.Errorf("invalid artifact path %q: %w", artifact.Path, err)
 		}
+		if artifact.Size > uint64(1<<63-1) {
+			return nil, fmt.Errorf("artifact size overflow %q", cleaned)
+		}
 		size := int64(artifact.Size)
 		if size > cfg.MaxOutputFileBytes {
 			return nil, SizeLimitError{Kind: "output_file", Path: cleaned, Size: size, Limit: cfg.MaxOutputFileBytes}
+		}
+		if size > (1<<63-1)-total {
+			return nil, fmt.Errorf("output total size overflow")
 		}
 		total += size
 		if total > cfg.MaxOutputTotalBytes {
@@ -305,20 +324,33 @@ func downloadArtifacts(ctx context.Context, store objectStore, artifacts []pytho
 	}
 
 	result := make(map[string][]byte, len(checked))
+	downloads := make([][]byte, len(checked))
 	var downloadedTotal int64
-	for _, artifact := range checked {
+	var mu sync.Mutex
+	err := transfer.Parallel(ctx, len(checked), func(ctx context.Context, i int) error {
+		artifact := checked[i]
 		data, err := store.GetBytes(ctx, artifact.Object)
 		if err != nil {
-			return nil, fmt.Errorf("download artifact %q: %w%s", artifact.Path, err, objectStoreConsumerDeletePermissionHint(err, cfg.Bucket))
+			return fmt.Errorf("download artifact %q: %w%s", artifact.Path, err, objectStoreConsumerDeletePermissionHint(err, cfg.Bucket))
 		}
 		if int64(len(data)) > cfg.MaxOutputFileBytes {
-			return nil, SizeLimitError{Kind: "output_file", Path: artifact.Path, Size: int64(len(data)), Limit: cfg.MaxOutputFileBytes}
+			return SizeLimitError{Kind: "output_file", Path: artifact.Path, Size: int64(len(data)), Limit: cfg.MaxOutputFileBytes}
 		}
+		mu.Lock()
+		defer mu.Unlock()
 		downloadedTotal += int64(len(data))
 		if downloadedTotal > cfg.MaxOutputTotalBytes {
-			return nil, SizeLimitError{Kind: "output_total", Size: downloadedTotal, Limit: cfg.MaxOutputTotalBytes}
+			return SizeLimitError{Kind: "output_total", Size: downloadedTotal, Limit: cfg.MaxOutputTotalBytes}
 		}
-		result[artifact.Path] = data
+		downloads[i] = data
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Preserve manifest-order overwrite semantics for duplicate paths.
+	for i, artifact := range checked {
+		result[artifact.Path] = downloads[i]
 	}
 	return result, nil
 }

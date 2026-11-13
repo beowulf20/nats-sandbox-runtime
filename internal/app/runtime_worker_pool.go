@@ -125,6 +125,9 @@ func (p *RuntimeWorkerPool) listWorkersLocked() []RuntimeWorker {
 func (p *RuntimeWorkerPool) AcquireWorker() (RuntimeWorker, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if len(p.inFlight) >= p.desiredCount {
+		return RuntimeWorker{}, false
+	}
 
 	for _, worker := range p.workers {
 		if !p.inFlight[worker.ID] {

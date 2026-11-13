@@ -36,6 +36,7 @@ services:
         condition: on-failure
 
   runtime:
+    stop_grace_period: 45s
     image: ${NATS_SANDBOX_RUNTIME_IMAGE:-nats-sandbox-runtime:local}
     environment:
       NATS_RUNTIME_MODE: api

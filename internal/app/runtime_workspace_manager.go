@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -17,7 +18,7 @@ const runtimeWorkspaceTTL = time.Hour
 type RuntimeWorkspaceManager struct {
 	mu      sync.Mutex
 	baseDir string
-	locks   map[string]*sync.Mutex
+	locks   map[string]chan struct{}
 	active  map[string]int
 }
 
@@ -30,12 +31,16 @@ type RuntimeWorkspaceLease struct {
 func NewRuntimeWorkspaceManager(snapshotDir string) *RuntimeWorkspaceManager {
 	return &RuntimeWorkspaceManager{
 		baseDir: filepath.Join(snapshotDir, "workspaces"),
-		locks:   map[string]*sync.Mutex{},
+		locks:   map[string]chan struct{}{},
 		active:  map[string]int{},
 	}
 }
 
 func (m *RuntimeWorkspaceManager) Begin(key string) (RuntimeWorkspaceLease, error) {
+	return m.BeginContext(context.Background(), key)
+}
+
+func (m *RuntimeWorkspaceManager) BeginContext(ctx context.Context, key string) (RuntimeWorkspaceLease, error) {
 	if m == nil {
 		return RuntimeWorkspaceLease{}, fmt.Errorf("workspace manager is not configured")
 	}
@@ -47,8 +52,7 @@ func (m *RuntimeWorkspaceManager) Begin(key string) (RuntimeWorkspaceLease, erro
 	m.mu.Lock()
 	m.active[key]++
 	m.mu.Unlock()
-	lock.Lock()
-	release := func() {
+	deactivate := func() {
 		m.mu.Lock()
 		if m.active[key] <= 1 {
 			delete(m.active, key)
@@ -56,7 +60,19 @@ func (m *RuntimeWorkspaceManager) Begin(key string) (RuntimeWorkspaceLease, erro
 			m.active[key]--
 		}
 		m.mu.Unlock()
-		lock.Unlock()
+
+	}
+	select {
+	case lock <- struct{}{}:
+	case <-ctx.Done():
+		deactivate()
+		return RuntimeWorkspaceLease{}, ctx.Err()
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { deactivate(); <-lock }) }
+	if err := ctx.Err(); err != nil {
+		release()
+		return RuntimeWorkspaceLease{}, err
 	}
 	dir := m.workspaceDir(key)
 	imagePath := filepath.Join(dir, "workspace.ext4")
@@ -143,12 +159,12 @@ func (m *RuntimeWorkspaceManager) Delete(key string) error {
 	return nil
 }
 
-func (m *RuntimeWorkspaceManager) lockFor(key string) *sync.Mutex {
+func (m *RuntimeWorkspaceManager) lockFor(key string) chan struct{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	lock := m.locks[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = make(chan struct{}, 1)
 		m.locks[key] = lock
 	}
 	return lock
