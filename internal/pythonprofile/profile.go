@@ -5,13 +5,14 @@ package pythonprofile
 import "fmt"
 
 const (
-	NumPy   = "numpy"
-	PlotAgg = "plot-agg"
+	NumPy     = "numpy"
+	PlotAgg   = "plot-agg"
+	PlotCairo = "plot-cairo"
 )
 
 func Validate(profile string) error {
 	switch profile {
-	case "", NumPy, PlotAgg:
+	case "", NumPy, PlotAgg, PlotCairo:
 		return nil
 	default:
 		return fmt.Errorf("unsupported import profile %q", profile)

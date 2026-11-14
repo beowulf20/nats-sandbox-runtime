@@ -330,12 +330,12 @@ func TestNATSPanicFailureAndInvalidPrefixReleaseWorker(t *testing.T) {
 }
 
 func TestNATSImportProfileValidationAndForwarding(t *testing.T) {
-	profiles := make(chan string, 3)
+	profiles := make(chan string, 4)
 	_, nc := concurrencyRuntime(t, 1, func(_ context.Context, cfg LocalPythonConfig) (LocalPythonExecResult, error) {
 		profiles <- cfg.ImportProfile
 		return LocalPythonExecResult{}, nil
 	})
-	for _, profile := range []string{"../escape", "unknown", "", "numpy", "plot-agg"} {
+	for _, profile := range []string{"../escape", "unknown", "", "numpy", "plot-agg", "plot-cairo"} {
 		data, err := json.Marshal(PythonRunRequest{Code: "fixture", ImportProfile: profile})
 		if err != nil {
 			t.Fatal(err)

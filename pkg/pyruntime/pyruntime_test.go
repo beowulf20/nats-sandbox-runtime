@@ -82,7 +82,7 @@ func TestRunEnforcesInputSizeLimits(t *testing.T) {
 }
 
 func TestImportProfilesAreOptInAndValidateBeforeUpload(t *testing.T) {
-	for _, profile := range []string{"", ImportProfileNumPy, ImportProfilePlotAgg} {
+	for _, profile := range []string{"", ImportProfileNumPy, ImportProfilePlotAgg, ImportProfilePlotCairo} {
 		client := newTestClient(Config{})
 		client.req = &fakeRequester{handle: func(_ string, data []byte) *nats.Msg {
 			var wire map[string]json.RawMessage
