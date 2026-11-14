@@ -26,6 +26,9 @@ import (
 //go:embed guest.py
 var guestCode string
 
+//go:embed io_backend.py
+var ioBackendCode string
+
 func status() map[string]int64 {
 	b, _ := os.ReadFile("/proc/self/status")
 	out := map[string]int64{}
@@ -53,10 +56,14 @@ func main() {
 	renderer := flag.String("renderer", "agg", "agg or cairo")
 	plotType := flag.String("plot-type", "line", "line, scatter or dense")
 	plotStyle := flag.String("plot-style", "default", "default or fast")
+	ioBackend := flag.String("io-backend", "sync", "sync, threads or uringio")
 	saveDir := flag.String("save-dir", "", "optional directory for first plot output")
 	charts := flag.Int("charts", 1, "charts per plot request")
 	compression := flag.Int("png-compression", 6, "PNG compression 0 through 9")
 	flag.Parse()
+	if *ioBackend != "sync" && *ioBackend != "threads" && *ioBackend != "uringio" {
+		panic("invalid I/O backend")
+	}
 	if *charts < 1 || *compression < 0 || *compression > 9 {
 		panic("invalid plot parameters")
 	}
@@ -101,8 +108,9 @@ func main() {
 				}
 				// Keep the serial command short. Load the fixture through the same
 				// workspace transfer path used for request data, and verify its hash.
-				files := map[string][]byte{"artifacts/benchmark.py": []byte(guestCode)}
-				inputBytes := int64(len(guestCode))
+				fixture := ioBackendCode + "\n" + guestCode
+				files := map[string][]byte{"artifacts/benchmark.py": []byte(fixture)}
+				inputBytes := int64(len(fixture))
 				if *phase != "warmup" {
 					count, size := 64, 1024
 					if mode == "io" {
@@ -116,6 +124,7 @@ func main() {
 				}
 				thread := fmt.Sprintf("lane-%d", lane)
 				code := fmt.Sprintf("thread=%q\nmode=%q\nrun_id=%d\nprofile=%q\ncharts=%d\ncompression=%d\nrenderer=%q\nplot_type=%q\nplot_style=%q\n", thread, mode, rep, *profile, *charts, *compression, *renderer, *plotType, *plotStyle) + "from pathlib import Path\nexec(compile(Path('artifacts/benchmark.py').read_text(), 'artifacts/benchmark.py', 'exec'), globals())\n"
+				code = fmt.Sprintf("io_backend=%q\n", *ioBackend) + code
 				result, err := c.Run(ctx, pyruntime.Request{ImportProfile: *profile, ThreadID: thread, Code: code, Files: files, ArtifactExcludePrefixes: []string{"artifacts/"}})
 				r["elapsed_ms"] = float64(time.Since(runStart)) / float64(time.Millisecond)
 				if err != nil {

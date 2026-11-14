@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+# Experimental dependency image. Kernel selection belongs to the local runner.
+ARG RUNTIME_IMAGE=nats-sandbox-runtime:local
+FROM ${RUNTIME_IMAGE} AS package
+USER root
+ARG GUEST_ROOTFS_SIZE=1536M
+COPY wheels/ /wheels/
+RUN set -eu; \
+ cd /wheels; sha256sum -c SHA256SUMS; \
+ mkdir /guest /out; \
+ debugfs -R 'rdump / /guest' /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4; \
+ for node in null zero random urandom; do rm -f /guest/dev/$node; cp -a /dev/$node /guest/dev/$node; done; \
+ mkdir -p /guest/tmp/uringio-wheel; \
+ cp /wheels/*.whl /guest/tmp/uringio-wheel/; \
+ for wheel in /guest/tmp/uringio-wheel/*.whl; do chroot /guest /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir --no-deps --no-index "/tmp/uringio-wheel/$(basename "$wheel")"; done; \
+ chroot /guest /usr/bin/python3 -m pip check; \
+ chroot /guest /usr/bin/python3 -c 'import importlib.metadata as m; print({n:m.version(n) for n in ("uringio","numpy","matplotlib","mplcairo")})'; \
+ rm -rf /guest/tmp/uringio-wheel /guest/root/.cache; \
+ truncate -s "$GUEST_ROOTFS_SIZE" /out/rootfs.ext4; \
+ mkfs.ext4 -q -F -d /guest /out/rootfs.ext4; \
+ e2fsck -fy /out/rootfs.ext4; resize2fs -M /out/rootfs.ext4; e2fsck -fn /out/rootfs.ext4; \
+ sha256sum /out/rootfs.ext4 > /out/rootfs.ext4.sha256
+
+FROM ${RUNTIME_IMAGE}
+COPY --from=package /out/rootfs.ext4 /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4
+COPY --from=package /out/rootfs.ext4.sha256 /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4.sha256

@@ -134,3 +134,86 @@ record image IDs and interpreter build flags. Wait for compiler builds to finish
 Host page caches are not flushed. Compare trial medians and paired variability,
 and distinguish local KVM results from deployment-host acceptance. Files under
 `tmp/`, including raw guest snapshots and benchmark reports, must stay out of commits.
+
+## Optional Linux 6.11 / uringio comparison
+
+`--kernel /absolute/path/to/vmlinux` bind-mounts an experimental guest kernel
+inside only the benchmark container. The host kernel, packaged image kernel and
+deployment configuration stay unchanged. The runner records the kernel SHA-256;
+each invocation gets fresh snapshots. Boot and restore the kernel successfully
+before comparing performance. On the tested AMD KVM host, upstream Linux 6.11.11
+needed `CONFIG_PVH=n`, `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y`, `CONFIG_PCI=y` and
+`CONFIG_X86_MPPARSE=y` on top of Firecracker v1.14.0's x86-64 6.1 guest config.
+Snapshot restore additionally needed `noxsaves`: without it, the guest panicked in
+FPU state restoration during `blockdev` execution. This is a local compatibility
+finding, not a universal requirement or an upgrade to the deployment kernel.
+
+To build that optional kernel, place the [6.11.11 source tarball](https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.11.11.tar.xz)
+and [Firecracker v1.14.0 baseline config](https://raw.githubusercontent.com/firecracker-microvm/firecracker/v1.14.0/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config)
+under `tmp/kernel-context/`, naming the config `firecracker-6.1.config`. The recipe
+checks both SHA-256 hashes before use. It builds a separate artifact, leaving the
+image and deployment kernel intact:
+
+```bash
+docker build -f scripts/python-bench/Dockerfile.kernel-6.11 \
+  --target artifacts --output type=local,dest=tmp/linux-6.11.11 \
+  tmp/kernel-context
+```
+
+The optional `Dockerfile.guest-uringio` adds only a locally supplied, hash-checked
+wheel to an existing CPython 3.12 x86-64 rootfs. Prepare a build context under
+`tmp/` containing `wheels/uringio-0.4.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl`
+and a `wheels/SHA256SUMS` file with this exact line:
+
+```text
+571ef4565ed08bfc6a098d42e70b44366a2b7cc61dda8b39b9ab4a9257e9e105  uringio-0.4.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+```
+
+Download that wheel from the [PyPI 0.4.4 release](https://pypi.org/project/uringio/0.4.4/#files),
+then build and compare with the same derivative image for every arm:
+
+```bash
+docker build -f Dockerfile.guest-uringio \
+  --build-arg RUNTIME_IMAGE=nats-sandbox-runtime:local \
+  -t nats-sandbox-uringio:local tmp/uringio-context
+python3 scripts/python-bench/benchmark.py \
+  --image nats-sandbox-uringio:local \
+  --runtime tmp/python-bench/runtime --client tmp/python-bench/client \
+  --kernel tmp/linux-6.11.11/vmlinux-6.11.11.bin --io-backend uringio \
+  --import-profile plot-agg --workload plot \
+  --output tmp/python-bench/uringio-plot-1
+```
+
+Compare the packaged kernel with `--io-backend sync`, then the experimental
+kernel with `sync`, `threads` and `uringio`. Run five fresh trials per workload
+and rotate variant order. `threads` uses a four-thread executor; `uringio` uses
+at most four concurrent file reads. All backends stream the same 64 KiB chunks,
+handle short writes, verify exact checksums and preserve manifest order. Reads
+are bounded by the known input file size. Read-only `uringio.open_file` calls
+explicitly pass `mode=0`, as required by `openat2` without creation flags.
+
+Plots encode to `BytesIO` for every backend, then use the selected file writer.
+Compare these variants with each other; this changed fixture is not an exact
+absolute-latency comparison with earlier direct-to-file plot measurements.
+Setup includes backend imports and event-loop creation after snapshot restore;
+the `plot-agg` snapshot warms Matplotlib/NumPy, not asyncio/uringio. Closing the
+loop is timed too. The service's Go filesystem/NATS transfers are unaffected.
+
+Results include setup, checksum-read, output-write and close times, kernel
+release, guest-wide swap usage and descriptor retention after loop shutdown.
+`io_fd_delta` is a diagnostic, not a passing cleanup assertion: stock uringio
+0.4.4 retained two signal-pipe descriptors per loop in the local probe, growing
+by ten across five create/close cycles even after GC. These experimental
+measurements do not qualify the library for adoption. A separate first-error
+probe also retained one to four regular-file descriptors after cancelling
+concurrent reads and closing the loop. The candidate's cancellation path needs
+ownership/cleanup work before reuse; successful-path timings do not validate it.
+EOF, missing-file errors and cancellation of a pending FIFO read were observed,
+but the final descriptor-cleanup assertion failed and that failure is retained.
+Each service job still
+destroys its separate VM/process after responding. Unit checks for the stdlib
+backends require zero retained descriptors:
+
+```bash
+python3 -m unittest discover -s scripts/python-bench
+```
