@@ -44,6 +44,11 @@ The build downloads the Firecracker release binary and Firecracker CI guest asse
 
 Python modules available inside the Firecracker guest are declared in the repo-root `requirements.txt`; the Docker build installs those requirements into the packaged guest rootfs.
 
+`GUEST_ROOTFS_SIZE` is the filesystem capacity used while preparing the guest.
+The build checks and shrinks the completed read-only filesystem before computing
+its checksum and copying it into the final image. The packaged root disk can
+therefore be smaller than that preparation capacity.
+
 The image defaults to `runtime api`, listens on `0.0.0.0:8080`, and expects a NATS server named `nats` with JetStream enabled.
 
 ```bash

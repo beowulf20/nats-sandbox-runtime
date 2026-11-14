@@ -77,6 +77,9 @@ RUN set -eu; \
 	mkdir -p /tmp/rootfs/workspace; \
 	truncate -s "${GUEST_ROOTFS_SIZE}" /out/rootfs.ext4; \
 	mkfs.ext4 -q -d /tmp/rootfs /out/rootfs.ext4; \
+	e2fsck -fy /out/rootfs.ext4; \
+	resize2fs -M /out/rootfs.ext4; \
+	e2fsck -fn /out/rootfs.ext4; \
 	sha256sum /out/rootfs.ext4 > /out/rootfs.ext4.sha256; \
 	rm -rf /tmp/rootfs /tmp/rootfs.squashfs
 
