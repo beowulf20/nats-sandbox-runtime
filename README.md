@@ -501,6 +501,17 @@ large root disk into a fresh container's writable layer on its first request.
 Snapshots leave the workspace unmounted. Each restored VM discards cached
 workspace block pages and mounts the current request's disk before dropping
 privileges, so filesystem metadata from a previous image is not reused.
+
+Full snapshots remain the default. `--sparse-boot-snapshot` is an experimental
+opt-in for `local python`, `runtime python` and `runtime api`: it tracks pages
+while booting the initial VM and saves a sparse, independently resumable boot
+snapshot. It does not create an incremental snapshot chain. Dirty tracking is
+disabled on ordinary restores, which retain on-demand file-backed loading.
+Full and sparse modes use different cache identities; thread workspaces are
+preserved when switching modes. Validate the opt-in with the pinned Firecracker
+version and representative KVM workloads before enabling it on a deployment.
+See the [Firecracker 1.14 snapshot documentation](https://github.com/firecracker-microvm/firecracker/blob/v1.14.0/docs/snapshotting/snapshot-support.md).
+
 Roll out the rebuilt image with its guest assets, rather than replacing only the
 runtime binary in an older image. Snapshots made with a writable root device are
 automatically invalidated; thread workspaces are preserved.

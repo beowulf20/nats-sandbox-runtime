@@ -607,6 +607,29 @@ func TestLocalPythonCommandAcceptsSnapshotDir(t *testing.T) {
 	}
 }
 
+func TestSparseBootSnapshotIsOptInForAllEntrypoints(t *testing.T) {
+	for _, entrypoint := range [][]string{{"local", "python"}, {"runtime", "python"}, {"runtime", "api"}} {
+		for _, enabled := range []bool{false, true} {
+			var got LocalPythonConfig
+			cmd := NewRootCommandWithRuntimeAPI(nil,
+				func(_ context.Context, cfg LocalPythonConfig) error { got = cfg; return nil },
+				func(_ context.Context, cfg RuntimePythonConfig) error { got = cfg.LocalPython; return nil },
+				func(_ context.Context, cfg RuntimeAPIConfig) error { got = cfg.Runtime.LocalPython; return nil })
+			args := append([]string(nil), entrypoint...)
+			if enabled {
+				args = append(args, "--sparse-boot-snapshot")
+			}
+			cmd.SetArgs(args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if got.SparseBootSnapshot != enabled {
+				t.Fatalf("%v sparse=%t, want %t", entrypoint, got.SparseBootSnapshot, enabled)
+			}
+		}
+	}
+}
+
 func TestLocalPythonCommandAcceptsWorkspaceDir(t *testing.T) {
 	var got LocalPythonConfig
 	cmd := NewRootCommand(nil, func(ctx context.Context, cfg LocalPythonConfig) error {

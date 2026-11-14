@@ -90,6 +90,39 @@ func TestLocalPythonVMConfigUsesKernelRootfsAndMemory(t *testing.T) {
 	}
 }
 
+func TestSparseBootSnapshotTrackingAndCacheIsolation(t *testing.T) {
+	full := defaultLocalPythonConfig()
+	sparse := full
+	sparse.SparseBootSnapshot = true
+	paths := localPythonSnapshotPaths(t.TempDir())
+	if localPythonVMConfig(full, paths, 0).MachineConfig.TrackDirtyPages {
+		t.Fatal("full snapshots unexpectedly enable dirty-page tracking")
+	}
+	if !localPythonVMConfig(sparse, paths, 0).MachineConfig.TrackDirtyPages {
+		t.Fatal("sparse boot snapshot does not track pages dirtied during boot")
+	}
+	for _, path := range []string{paths.StatePath, paths.MemoryPath} {
+		if err := os.WriteFile(path, []byte("snapshot"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	full.SwapMiB, sparse.SwapMiB = 0, 0
+	for _, cfg := range []LocalPythonConfig{full, sparse} {
+		if err := os.WriteFile(paths.VersionPath, []byte(localPythonSnapshotVersion(cfg)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if check := localPythonSnapshotCheck(paths, cfg); !check.OK {
+			t.Fatal(check.Reason)
+		}
+		other := cfg
+		other.SparseBootSnapshot = !cfg.SparseBootSnapshot
+		if localPythonSnapshotCheck(paths, other).OK {
+			t.Fatal("full and sparse modes reused the same cache")
+		}
+	}
+}
+
+
 func TestRunLocalPythonRejectsInvalidMemoryBeforeAssetChecks(t *testing.T) {
 	err := RunLocalPython(t.Context(), LocalPythonConfig{
 		KernelPath: "missing-kernel",
