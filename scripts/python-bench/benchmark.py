@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated KVM/NATS benchmark; never uses deployment configuration."""
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -64,6 +65,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--image', required=True)
     p.add_argument('--runtime', type=Path, required=True)
+    p.add_argument('--kernel', type=Path, help='experimental guest kernel bind mount; never changes deployment')
+    p.add_argument('--io-backend', choices=['sync','threads','uringio'], default='sync')
     p.add_argument('--client', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--workload', choices=['small', 'cpu', 'io', 'plot', 'blas', 'blas1', 'audit', 'backend', 'state'], default='cpu')
@@ -95,8 +98,11 @@ def main():
     phase = ['startup']
     thread = None
     meta = dict(vars(args), runtime=str(args.runtime.resolve()), client=str(args.client.resolve()),
+                kernel=str(args.kernel.resolve()) if args.kernel else None,
                 output=str(out), started=time.time(), workers=2, parallel=2, guest_swap_mib=256,
                 workspace_mib=64, broker_memory_mib=512, combined_memory_swap_mib=args.memory_mib + 256)
+    if args.kernel:
+        meta['kernel_sha256']=hashlib.file_digest(args.kernel.open('rb'),'sha256').hexdigest()
     meta['image'] = args.image
     meta['fixture_transport'] = 'workspace_file'
     try:
@@ -106,7 +112,8 @@ def main():
         created.append(broker)
         port = api(f'/containers/{broker}/json')['NetworkSettings']['Ports']['4222/tcp'][0]['HostPort']
         bucket = 'PY_BENCH_' + uuid.uuid4().hex
-        cid = command(['docker', 'run', '-d', '--name', name, '--network', tag, '--memory', f'{args.memory_mib}m', '--memory-swap', f'{args.memory_mib + 256}m', '--pids-limit', '256', '--device', '/dev/kvm', '--security-opt', 'seccomp=unconfined', '--mount', f'type=bind,src={args.runtime.resolve()},dst=/bench/runtime,readonly', '--mount', f'type=bind,src={state},dst=/opt/nats-sandbox-runtime/firecracker-assets/python-snapshot', '--entrypoint', '/bench/runtime', args.image, 'runtime', 'python', '--url', f'nats://{broker}:4222', '--bucket', bucket, '--workers', '2', '--memory-mib', str(args.guest_memory_mib), '--swap-mib', '256', '--workspace-mib', '64', '--exec-timeout', '30s', '--hide-firecracker-log', '--artifact-ttl', '0s', '--artifact-cleanup-interval', '0s'])
+        kernel_mount = ['--mount',f'type=bind,src={args.kernel.resolve()},dst=/opt/nats-sandbox-runtime/firecracker-assets/vmlinux.bin,readonly'] if args.kernel else []
+        cid = command(['docker', 'run', '-d', '--name', name, '--network', tag, '--memory', f'{args.memory_mib}m', '--memory-swap', f'{args.memory_mib + 256}m', '--pids-limit', '256', '--device', '/dev/kvm', '--security-opt', 'seccomp=unconfined', *kernel_mount, '--mount', f'type=bind,src={args.runtime.resolve()},dst=/bench/runtime,readonly', '--mount', f'type=bind,src={state},dst=/opt/nats-sandbox-runtime/firecracker-assets/python-snapshot', '--entrypoint', '/bench/runtime', args.image, 'runtime', 'python', '--url', f'nats://{broker}:4222', '--bucket', bucket, '--workers', '2', '--memory-mib', str(args.guest_memory_mib), '--swap-mib', '256', '--workspace-mib', '64', '--exec-timeout', '30s', '--hide-firecracker-log', '--artifact-ttl', '0s', '--artifact-cleanup-interval', '0s'])
         created.append(name)
         thread = threading.Thread(target=monitor, args=(cid, out / 'samples.jsonl', stop, phase), daemon=True)
         thread.start()
@@ -121,6 +128,8 @@ def main():
         (out / 'host-memory-before.txt').write_text(command(['docker', 'exec', name, '/bin/cat', '/proc/meminfo', '/proc/pressure/memory']))
         (out / 'cgroup-start.txt').write_text(cgroup(name))
         base = [str(args.client.resolve()), '--url', 'nats://127.0.0.1:' + port, '--bucket', bucket, '--parallel', '2', '--import-profile', args.import_profile, '--renderer', args.renderer, '--charts', str(args.charts), '--png-compression', str(args.png_compression)]
+        if args.io_backend!='sync':
+            base.extend(['--io-backend',args.io_backend])
         phases = [('warmup', ['--phase', 'warmup', '--repeats', '1'])]
         plot_types = args.plot_types if args.workload == 'plot' else ['line']
         plot_styles = args.plot_styles if args.workload == 'plot' else ['default']

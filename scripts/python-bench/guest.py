@@ -12,8 +12,11 @@ if marker.exists(): assert marker.read_text()==thread
 marker.write_text(thread)
 os.makedirs('outputs',exist_ok=True)
 started=time.perf_counter()
+io_started=time.perf_counter()
+engine=BenchIO(io_backend)
+io_setup_ms=(time.perf_counter()-io_started)*1000
 input_hash_started=time.perf_counter()
-inputs={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('artifacts').glob('*') if p.is_file()}
+inputs=engine.hash_files(sorted(p for p in Path('artifacts').glob('*') if p.is_file()))
 input_hash_ms=(time.perf_counter()-input_hash_started)*1000
 payload_bytes=0
 import_ms=0
@@ -99,8 +102,9 @@ if mode=='backend':
     backend=plt.get_backend()
 if mode=='io':
     chunk=b'x'*65536
-    with open('outputs/payload.bin','wb') as out:
-        for _ in range(128): out.write(chunk)
+    write_started=time.perf_counter()
+    engine.write('outputs/payload.bin',chunk,128)
+    extra['output_write_ms']=(time.perf_counter()-write_started)*1000
     payload_bytes=8*1024*1024
 if mode=='plot':
     selected_backend='Agg' if renderer=='agg' else 'module://mplcairo.base'
@@ -155,7 +159,14 @@ if mode=='plot':
             finally: draw_times.append((time.perf_counter()-draw_start)*1000)
         fig.draw=measured_draw
         t=time.perf_counter()
-        fig.savefig('outputs/chart-'+str(chart)+'.png',pil_kwargs={'compress_level':compression})
+        import io
+        png=io.BytesIO()
+        encode_started=time.perf_counter()
+        fig.savefig(png,format='png',pil_kwargs={'compress_level':compression})
+        extra['png_encode_ms']=extra.get('png_encode_ms',0)+(time.perf_counter()-encode_started)*1000
+        write_started=time.perf_counter()
+        engine.write('outputs/chart-'+str(chart)+'.png',png.getvalue())
+        extra['png_write_ms']=extra.get('png_write_ms',0)+(time.perf_counter()-write_started)*1000
         save_ms+=(time.perf_counter()-t)*1000
         assert draw_times
         draw_ms+=sum(draw_times)
@@ -163,6 +174,9 @@ if mode=='plot':
     extra.update(axes_ms=axes_ms,save_ms=save_ms,draw_ms=draw_ms,png_other_ms=save_ms-draw_ms,
                  plot_type=plot_type,points=len(x),data_hash=data_hash,titles=titles)
     extra['plot_backend']=plt.get_backend()
+close_started=time.perf_counter()
+fd_delta=engine.close()
+io_close_ms=(time.perf_counter()-close_started)*1000
 stats={}
 for line in open('/proc/self/status'):
     key,_,value=line.partition(':')
@@ -171,5 +185,8 @@ for line in open('/proc/vmstat'):
     key,value=line.split()
     if key in ('pgmajfault','pswpin','pswpout'): stats[key]=int(value)
 stats.update(extra)
+mem={line.split(':')[0]:int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.split(':')[0] in ('SwapTotal','SwapFree','MemAvailable')}
+stats.update(io_backend=io_backend,io_setup_ms=io_setup_ms,io_close_ms=io_close_ms,io_fd_delta=fd_delta,
+             guest_kernel=os.uname().release,guest_swap_used_kib=mem['SwapTotal']-mem['SwapFree'],guest_mem_available_kib=mem['MemAvailable'])
 stats.update(backend=backend,input_hashes=inputs,input_hash_ms=input_hash_ms,payload_bytes=payload_bytes,import_ms=import_ms,processing_ms=(time.perf_counter()-started)*1000)
 Path('outputs/metrics.json').write_text(json.dumps(stats))

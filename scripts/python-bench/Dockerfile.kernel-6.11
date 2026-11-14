@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+# Optional local experiment. Build context contains the two verified inputs.
+FROM ubuntu:24.04 AS configuration
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential bc bison flex libssl-dev libelf-dev python3 xz-utils ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY linux-6.11.11.tar.xz firecracker-6.1.config ./
+RUN echo '62148e7e17f54c4a5ab5e75ad4882682c54bee818948be61a5963234fc0849fc  linux-6.11.11.tar.xz' > SHA256SUMS && \
+    echo '391d8d498f89e56b391be5ea4a7501ebc44e6d094331ecaabdefed1da6b28a96  firecracker-6.1.config' >> SHA256SUMS && \
+    sha256sum -c SHA256SUMS && tar -xf linux-6.11.11.tar.xz && \
+    cp firecracker-6.1.config linux-6.11.11/.config && rm linux-6.11.11.tar.xz
+WORKDIR /build/linux-6.11.11
+# Keep olddefconfig after each group to reproduce the measured configuration.
+RUN make olddefconfig && \
+    scripts/config --enable IO_URING --enable IKCONFIG --enable IKCONFIG_PROC --disable DEBUG_INFO_BTF && make olddefconfig && \
+    scripts/config --disable PVH --enable VIRTIO_MMIO_CMDLINE_DEVICES && make olddefconfig && \
+    scripts/config --enable PCI --enable X86_MPPARSE && make olddefconfig && \
+    scripts/config --enable CMDLINE_BOOL --set-str CMDLINE noxsaves --disable CMDLINE_OVERRIDE && make olddefconfig
+
+FROM configuration AS build
+ARG BUILD_JOBS=8
+RUN make -j${BUILD_JOBS} vmlinux && mkdir /out && \
+    cp vmlinux /out/vmlinux-6.11.11.bin && cp .config /out/linux-6.11.11.config && \
+    cd /out && sha256sum vmlinux-6.11.11.bin linux-6.11.11.config > SHA256SUMS
+
+FROM scratch AS config
+COPY --from=configuration /build/linux-6.11.11/.config /linux-6.11.11.config
+
+FROM scratch AS artifacts
+COPY --from=build /out/ /
