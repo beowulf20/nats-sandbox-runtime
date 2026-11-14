@@ -122,6 +122,7 @@ func main() {
 					r["error"] = err.Error()
 					return
 				}
+				r["run_id"] = result.RunID
 				var metrics map[string]any
 				if err := json.Unmarshal(result.Files["outputs/metrics.json"], &metrics); err != nil {
 					r["error"] = fmt.Sprint("metrics: ", err)

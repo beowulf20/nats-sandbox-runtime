@@ -49,10 +49,13 @@ func TestWarmRestoreUsesFreshHostEntropyAndGenericStaysUnchanged(t *testing.T) {
 	if a == b {
 		t.Fatal("repeated host entropy")
 	}
-	input := localPythonExecInputForProfile("pass", "job.py", true, "numpy")
+	input := localPythonExecHelper("numpy")
 	reseed, drop := strings.Index(input, "fcntl.ioctl"), strings.Index(input, "os.setuid")
 	if reseed < 0 || drop < reseed {
 		t.Fatal("kernel reseed requires root")
+	}
+	if localPythonExecInputForProfile("pass", "job.py", true, "numpy") == localPythonExecInputForProfile("pass", "job.py", true, "numpy") {
+		t.Fatal("cached helper reused request entropy")
 	}
 }
 

@@ -50,6 +50,10 @@ func localPythonWarmImports(profile string) string {
 // Host entropy is mixed and credited only inside this private guest, while root
 // privileges are still available. Explicit user seeds continue to work normally.
 func localPythonWarmRestore(profile string) string {
+	return localPythonWarmRestoreWithSeed(profile, strconv.Quote(localPythonRestoreSeed(profile)))
+}
+
+func localPythonRestoreSeed(profile string) string {
 	if profile == "" {
 		return ""
 	}
@@ -57,7 +61,14 @@ func localPythonWarmRestore(profile string) string {
 	if _, err := rand.Read(seed); err != nil {
 		panic("host entropy unavailable")
 	}
-	return "__nats_seed = bytes.fromhex(" + strconv.Quote(hex.EncodeToString(seed)) + ")\n" +
+	return hex.EncodeToString(seed)
+}
+
+func localPythonWarmRestoreWithSeed(profile, seed string) string {
+	if profile == "" {
+		return ""
+	}
+	return "__nats_seed = bytes.fromhex(" + seed + ")\n" +
 		"with open('/dev/random', 'wb', buffering=0) as __nats_rng:\n" +
 		"    fcntl.ioctl(__nats_rng, 0x40085203, struct.pack('ii', 256, len(__nats_seed)) + __nats_seed)\n" +
 		"    fcntl.ioctl(__nats_rng, 0x5207)\n" +
