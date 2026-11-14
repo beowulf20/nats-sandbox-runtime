@@ -266,6 +266,14 @@ Requests may include `"artifact_exclude_prefixes": ["artifacts/"]` to omit an in
 
 Runtime fetches/publications and SDK uploads/downloads share a limit of four concurrent transfers per process. Manifests stay sorted regardless of completion order. On failure, pending transfers are cancelled and started transfers joined; no partial successful result is returned. Already published objects remain subject to normal retention.
 
+Input downloads stream into temporary files confined to the workspace and replace
+destinations only after a complete, validated transfer. This also truncates shorter
+replacement inputs correctly. Each input is bounded by the effective workspace
+capacity; the full workspace limit is checked again before execution.
+After a VM stops, the runtime replays its workspace journal before reading files
+with `debugfs`, so committed guest writes are visible to artifact export and the
+next request. A failed journal replay returns an error instead of partial output.
+
 Run a simple inline script:
 
 ```bash

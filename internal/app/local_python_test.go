@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -122,6 +123,71 @@ func TestSparseBootSnapshotTrackingAndCacheIsolation(t *testing.T) {
 	}
 }
 
+func TestLocalPythonWorkspaceRecoveryFailurePreservesFiles(t *testing.T) {
+	if _, err := exec.LookPath("e2fsck"); err != nil {
+		t.Skip("e2fsck is required")
+	}
+	dir := t.TempDir()
+	workspace := filepath.Join(dir, "workspace")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "retained"), []byte("valid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	image := filepath.Join(dir, "invalid.ext4")
+	if err := os.WriteFile(image, []byte("not a filesystem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := syncLocalPythonWorkspaceImage(t.Context(), LocalPythonConfig{WorkspaceDir: workspace}, localPythonSnapshotFiles{WorkspacePath: image})
+	if err == nil || !strings.Contains(err.Error(), "recover workspace journal") {
+		t.Fatalf("error=%v, want failed recovery", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(workspace, "retained"))
+	if string(data) != "valid" {
+		t.Fatal("failed recovery replaced valid files")
+	}
+}
+
+func TestLocalPythonWorkspaceJournalReplayFixture(t *testing.T) {
+	fixture := os.Getenv("NATS_RUNTIME_JOURNAL_FIXTURE")
+	if fixture == "" {
+		t.Skip("set NATS_RUNTIME_JOURNAL_FIXTURE to an unclean KVM workspace with committed outputs/metrics.json")
+	}
+	in, err := os.Open(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	image := filepath.Join(t.TempDir(), "workspace.ext4")
+	out, err := os.Create(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		t.Fatalf("copy=%v close=%v", copyErr, closeErr)
+	}
+	before, err := exec.CommandContext(t.Context(), "debugfs", "-R", "cat /outputs/metrics.json", image).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json.Valid(before) {
+		t.Fatal("fixture is already checkpointed; it cannot exercise journal recovery")
+	}
+	workspace := t.TempDir()
+	if err := syncLocalPythonWorkspaceImage(t.Context(), LocalPythonConfig{WorkspaceDir: workspace}, localPythonSnapshotFiles{WorkspacePath: image}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(workspace, "outputs/metrics.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("committed artifact was not recovered: %q", data)
+	}
+}
 
 func TestRunLocalPythonRejectsInvalidMemoryBeforeAssetChecks(t *testing.T) {
 	err := RunLocalPython(t.Context(), LocalPythonConfig{

@@ -558,6 +558,15 @@ func isInvalidLocalPythonSnapshotLoadError(err error) bool {
 }
 
 func syncLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig, paths localPythonSnapshotFiles) error {
+	// The VM has stopped, but sync() only guarantees a committed journal. Raw
+	// debugfs reads do not replay it and can otherwise export missing/empty files.
+	cmd := exec.CommandContext(ctx, "e2fsck", "-p", "-E", "journal_only", paths.WorkspacePath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return fmt.Errorf("recover workspace journal: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+	}
 	workspaceParent := filepath.Dir(cfg.WorkspaceDir)
 	if err := os.MkdirAll(workspaceParent, 0o755); err != nil {
 		return fmt.Errorf("create workspace parent dir: %w", err)
@@ -572,7 +581,7 @@ func syncLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig, p
 			_ = os.RemoveAll(syncDir)
 		}
 	}()
-	cmd := exec.CommandContext(ctx, "debugfs", "-R", "rdump / "+syncDir, paths.WorkspacePath)
+	cmd = exec.CommandContext(ctx, "debugfs", "-R", "rdump / "+syncDir, paths.WorkspacePath)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("sync workspace image: %w: %s", err, strings.TrimSpace(string(output)))
 	}

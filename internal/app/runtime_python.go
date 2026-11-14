@@ -864,7 +864,7 @@ func wrapRuntimePythonCode(code, startMarker, endMarker, completionMarker string
 		"print(" + strconv.Quote(startMarker) + ")\n" +
 		code + "\n" +
 		"print(" + strconv.Quote(endMarker) + ")\n" +
-		"__nats_runtime_subprocess.run(['/usr/bin/sync'], check=False)\n" +
+		"__nats_runtime_subprocess.run(['/usr/bin/sync'], check=True)\n" +
 		"print(" + strconv.Quote(completionMarker) + ")\n"
 }
 
