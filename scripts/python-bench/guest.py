@@ -12,7 +12,7 @@ if marker.exists(): assert marker.read_text()==thread
 marker.write_text(thread)
 os.makedirs('outputs',exist_ok=True)
 started=time.perf_counter()
-inputs={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('artifacts').glob('*.bin')}
+inputs={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('artifacts').glob('*') if p.is_file()}
 payload_bytes=0
 import_ms=0
 backend=''
@@ -79,7 +79,7 @@ if mode=='state':
     extra['random_values']=[random.random(),float(np.random.random()),float(np.random.default_rng().random()),os.urandom(16).hex()]
     random.seed(42);np.random.seed(42)
     assert random.random()==0.6394267984578837 and np.isclose(np.random.random(),0.3745401188473625)
-    if profile=='plot-agg':
+    if profile in ('plot-agg','plot-cairo'):
         import matplotlib.pyplot as plt
         assert not plt.get_fignums()
         assert plt.rcParams['lines.linewidth']==1.5
@@ -101,20 +101,54 @@ if mode=='io':
         for _ in range(128): out.write(chunk)
     payload_bytes=8*1024*1024
 if mode=='plot':
-    os.environ['MPLBACKEND']='Agg'
-    if profile!='plot-agg': os.environ['MPLCONFIGDIR']='/workspace/artifacts/mplconfig'
+    selected_backend='Agg' if renderer=='agg' else 'module://mplcairo.base'
+    os.environ['MPLBACKEND']=selected_backend
+    if profile not in ('plot-agg','plot-cairo'): os.environ['MPLCONFIGDIR']='/workspace/artifacts/mplconfig'
     t=time.perf_counter()
     import matplotlib.pyplot as plt
     import_ms=(time.perf_counter()-t)*1000
-    axes_ms=save_ms=0
+    import numpy as np, importlib.metadata
+    if renderer=='cairo':
+        import cairo, mplcairo
+        extra.update(cairo_version=cairo.cairo_version_string(),mplcairo_version=importlib.metadata.version('mplcairo'),cairo_options={k:str(v) for k,v in mplcairo.get_options().items()})
+    extra.update(numpy_version=np.__version__,matplotlib_version=importlib.metadata.version('matplotlib'))
+    assert plt.get_backend().lower()==selected_backend.lower()
+    rng=np.random.default_rng(12345)
+    if plot_type=='scatter':
+        x=rng.normal(size=5000);y=0.4*x+rng.normal(scale=0.5,size=5000)
+    elif plot_type=='dense':
+        x=np.linspace(0,20,100000);y=np.sin(x)*np.cos(3*x)+0.05*np.sin(150*x)
+    else:
+        x=np.linspace(0,6*np.pi,2000);y=np.sin(x)+0.2*np.cos(3*x)
+    data_hash=hashlib.sha256(np.column_stack((x,y)).astype('<f8').tobytes()).hexdigest()
+    axes_ms=save_ms=draw_ms=0
+    titles=[]
     for chart in range(charts):
         t=time.perf_counter()
-        plt.plot(range(1000),[i*i+chart*i for i in range(1000)])
+        fig,ax=plt.subplots(figsize=(6.4,4.8),dpi=100)
+        if plot_type=='scatter': ax.scatter(x,y,s=12,alpha=0.65,color='#1f77b4')
+        else: ax.plot(x,y,color='#1f77b4')
+        title=plot_type.capitalize()+' / seed 12345'
+        ax.set(title=title,xlabel='Input',ylabel='Value')
+        assert len(ax.collections if plot_type=='scatter' else ax.lines)==1
+        assert ax.get_xlabel()=='Input' and ax.get_ylabel()=='Value' and ax.get_title()==title
+        titles.append(title)
         axes_ms+=(time.perf_counter()-t)*1000
+        draw_times=[]
+        original_draw=fig.draw
+        def measured_draw(target_renderer):
+            draw_start=time.perf_counter()
+            try: return original_draw(target_renderer)
+            finally: draw_times.append((time.perf_counter()-draw_start)*1000)
+        fig.draw=measured_draw
         t=time.perf_counter()
-        plt.savefig('outputs/chart-'+str(chart)+'.png',pil_kwargs={'compress_level':compression});plt.close()
+        fig.savefig('outputs/chart-'+str(chart)+'.png',pil_kwargs={'compress_level':compression})
         save_ms+=(time.perf_counter()-t)*1000
-    extra.update(axes_ms=axes_ms,save_ms=save_ms)
+        assert draw_times
+        draw_ms+=sum(draw_times)
+        plt.close(fig)
+    extra.update(axes_ms=axes_ms,save_ms=save_ms,draw_ms=draw_ms,png_other_ms=save_ms-draw_ms,
+                 plot_type=plot_type,points=len(x),data_hash=data_hash,titles=titles)
     extra['plot_backend']=plt.get_backend()
 stats={}
 for line in open('/proc/self/status'):

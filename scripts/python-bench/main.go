@@ -13,6 +13,7 @@ import (
 	"image/draw"
 	"image/png"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -48,12 +49,21 @@ func main() {
 	_ = flag.Int("size-mib", 1, "compatibility")
 	_ = flag.Int("iterations", 1, "compatibility")
 	_ = flag.Int("files", 0, "compatibility")
-	profile := flag.String("import-profile", "", "empty, numpy, plot-agg")
+	profile := flag.String("import-profile", "", "empty, numpy, plot-agg, plot-cairo")
+	renderer := flag.String("renderer", "agg", "agg or cairo")
+	plotType := flag.String("plot-type", "line", "line, scatter or dense")
+	saveDir := flag.String("save-dir", "", "optional directory for first plot output")
 	charts := flag.Int("charts", 1, "charts per plot request")
 	compression := flag.Int("png-compression", 6, "PNG compression 0 through 9")
 	flag.Parse()
 	if *charts < 1 || *compression < 0 || *compression > 9 {
 		panic("invalid plot parameters")
+	}
+	if (*renderer != "agg" && *renderer != "cairo") || (*plotType != "line" && *plotType != "scatter" && *plotType != "dense") {
+		panic("invalid renderer or plot type")
+	}
+	if (*profile == pyruntime.ImportProfilePlotAgg && *renderer != "agg") || (*profile == pyruntime.ImportProfilePlotCairo && *renderer != "cairo") {
+		panic("renderer conflicts with warm profile")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -85,10 +95,12 @@ func main() {
 				if *phase == "warmup" {
 					mode = "small"
 				}
-				files := map[string][]byte{}
-				inputBytes := int64(0)
+				// Keep the serial command short. Load the fixture through the same
+				// workspace transfer path used for request data, and verify its hash.
+				files := map[string][]byte{"artifacts/benchmark.py": []byte(guestCode)}
+				inputBytes := int64(len(guestCode))
 				if *phase != "warmup" {
-					count, size := 65, 1024
+					count, size := 64, 1024
 					if mode == "io" {
 						count, size = 4, 4*1024*1024
 					}
@@ -99,7 +111,7 @@ func main() {
 					}
 				}
 				thread := fmt.Sprintf("lane-%d", lane)
-				code := fmt.Sprintf("thread=%q\nmode=%q\nrun_id=%d\nprofile=%q\ncharts=%d\ncompression=%d\n", thread, mode, rep, *profile, *charts, *compression) + guestCode
+				code := fmt.Sprintf("thread=%q\nmode=%q\nrun_id=%d\nprofile=%q\ncharts=%d\ncompression=%d\nrenderer=%q\nplot_type=%q\n", thread, mode, rep, *profile, *charts, *compression, *renderer, *plotType) + "from pathlib import Path\nexec(compile(Path('artifacts/benchmark.py').read_text(), 'artifacts/benchmark.py', 'exec'), globals())\n"
 				result, err := c.Run(ctx, pyruntime.Request{ImportProfile: *profile, ThreadID: thread, Code: code, Files: files, ArtifactExcludePrefixes: []string{"artifacts/"}})
 				r["elapsed_ms"] = float64(time.Since(runStart)) / float64(time.Millisecond)
 				if err != nil {
@@ -156,10 +168,24 @@ func main() {
 							return
 						}
 						bounds := img.Bounds()
+						if bounds.Dx() != 640 || bounds.Dy() != 480 {
+							r["error"] = "unexpected plot dimensions"
+							return
+						}
 						rgba := image.NewRGBA(bounds)
 						draw.Draw(rgba, bounds, img, bounds.Min, draw.Src)
 						sum := sha256.Sum256(rgba.Pix)
 						pixelHashes = append(pixelHashes, hex.EncodeToString(sum[:]))
+						if *saveDir != "" && rep == 0 && lane == 0 {
+							if err := os.MkdirAll(*saveDir, 0755); err != nil {
+								r["error"] = err.Error()
+								return
+							}
+							if err := os.WriteFile(filepath.Join(*saveDir, filepath.Base(name)), result.Files[name], 0644); err != nil {
+								r["error"] = err.Error()
+								return
+							}
+						}
 					}
 					r["pixel_hashes"] = pixelHashes
 				}
