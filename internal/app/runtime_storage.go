@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"nats-sandbox-runtime/internal/pythonprofile"
 )
 
 type runtimeStorageFile struct {
@@ -81,10 +83,14 @@ func resetRuntimeSnapshot(pool *RuntimeWorkerPool, workerID string) error {
 	if worker.Status == runtimeWorkerBusy {
 		return runtimeStorageConflictError{message: fmt.Sprintf("worker %q is busy", worker.ID)}
 	}
-	paths := localPythonSnapshotPaths(worker.SnapshotDir)
-	for _, path := range []string{paths.StatePath, paths.MemoryPath, paths.VersionPath, paths.SwapPath} {
-		if err := removeRuntimeStorageFile(path); err != nil {
-			return err
+	for _, profile := range []string{"", pythonprofile.NumPy, pythonprofile.PlotAgg} {
+		cfg := runtimeStorageWorkerConfig(pool, worker)
+		cfg.ImportProfile = profile
+		paths := localPythonSnapshotPathsForConfig(cfg)
+		for _, path := range []string{paths.StatePath, paths.MemoryPath, paths.VersionPath, paths.SwapPath} {
+			if err := removeRuntimeStorageFile(path); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"nats-sandbox-runtime/internal/observability"
+	"nats-sandbox-runtime/internal/pythonprofile"
 	"os"
 	"os/signal"
 	"syscall"
@@ -42,6 +43,7 @@ type Config struct {
 }
 
 type LocalPythonConfig struct {
+	ImportProfile          string
 	KernelPath             string
 	RootfsPath             string
 	FirecrackerPath        string
@@ -186,6 +188,9 @@ func defaultLocalPythonConfig() LocalPythonConfig {
 }
 
 func validateLocalPythonConfig(cfg LocalPythonConfig) error {
+	if err := pythonprofile.Validate(cfg.ImportProfile); err != nil {
+		return err
+	}
 	if cfg.MemoryMiB < 1 {
 		return fmt.Errorf("memory-mib must be at least 1")
 	}

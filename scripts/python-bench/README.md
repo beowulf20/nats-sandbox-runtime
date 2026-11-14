@@ -40,6 +40,14 @@ Available workloads:
 | `blas`, `blas1` | NumPy matrix multiplication, default pools versus explicit one-thread environment |
 | `audit` | Exact interpreter/build/package versions, effective import-path bytecode validity and active NumPy OpenBLAS thread count |
 | `backend` | Caller-selected SVG backend and workspace-local module imports |
+| `state` | Fresh Python/NumPy/kernel random values, deterministic explicit seeds and no retained user globals/figures/rcParams |
+
+Use `--import-profile numpy` or `--import-profile plot-agg` for a prewarmed
+comparison, keeping generic execution as the baseline. `--charts 4` generates
+four plots in one execution to measure import/restore amortization.
+`--png-compression 1` trades larger lossless PNG files for faster encoding; the
+default is 6. Plot results record hashes of decoded RGBA pixels so warm imports,
+batching and compression can be compared without relying on PNG byte identity.
 
 All requests check read-only root, writable workspace, UID 65534, Python
 assertions, thread identity and file exclusions. Input content changes on each

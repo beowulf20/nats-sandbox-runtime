@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	"image/draw"
 	"image/png"
 	"os"
 	"runtime"
@@ -46,7 +48,13 @@ func main() {
 	_ = flag.Int("size-mib", 1, "compatibility")
 	_ = flag.Int("iterations", 1, "compatibility")
 	_ = flag.Int("files", 0, "compatibility")
+	profile := flag.String("import-profile", "", "empty, numpy, plot-agg")
+	charts := flag.Int("charts", 1, "charts per plot request")
+	compression := flag.Int("png-compression", 6, "PNG compression 0 through 9")
 	flag.Parse()
+	if *charts < 1 || *compression < 0 || *compression > 9 {
+		panic("invalid plot parameters")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 	c, err := pyruntime.New(ctx, pyruntime.Config{URL: *url, Bucket: *bucket})
@@ -91,8 +99,8 @@ func main() {
 					}
 				}
 				thread := fmt.Sprintf("lane-%d", lane)
-				code := fmt.Sprintf("thread=%q\nmode=%q\nrun_id=%d\n", thread, mode, rep) + guestCode
-				result, err := c.Run(ctx, pyruntime.Request{ThreadID: thread, Code: code, Files: files, ArtifactExcludePrefixes: []string{"artifacts/"}})
+				code := fmt.Sprintf("thread=%q\nmode=%q\nrun_id=%d\nprofile=%q\ncharts=%d\ncompression=%d\n", thread, mode, rep, *profile, *charts, *compression) + guestCode
+				result, err := c.Run(ctx, pyruntime.Request{ImportProfile: *profile, ThreadID: thread, Code: code, Files: files, ArtifactExcludePrefixes: []string{"artifacts/"}})
 				r["elapsed_ms"] = float64(time.Since(runStart)) / float64(time.Millisecond)
 				if err != nil {
 					r["error"] = err.Error()
@@ -139,10 +147,21 @@ func main() {
 					}
 				}
 				if mode == "plot" {
-					if _, err := png.Decode(bytes.NewReader(result.Files["outputs/chart.png"])); err != nil {
-						r["error"] = fmt.Sprint("invalid plot: ", err)
-						return
+					pixelHashes := []string{}
+					for chart := range *charts {
+						name := fmt.Sprintf("outputs/chart-%d.png", chart)
+						img, err := png.Decode(bytes.NewReader(result.Files[name]))
+						if err != nil {
+							r["error"] = fmt.Sprint("invalid plot: ", err)
+							return
+						}
+						bounds := img.Bounds()
+						rgba := image.NewRGBA(bounds)
+						draw.Draw(rgba, bounds, img, bounds.Min, draw.Src)
+						sum := sha256.Sum256(rgba.Pix)
+						pixelHashes = append(pixelHashes, hex.EncodeToString(sum[:]))
 					}
+					r["pixel_hashes"] = pixelHashes
 				}
 				r["input_bytes"], r["output_bytes"], r["artifact_count"], r["guest"] = inputBytes, outputBytes, len(result.Files), metrics
 				r["throughput_mib_s"] = float64(inputBytes+outputBytes) / (1024 * 1024) / (time.Since(runStart).Seconds())

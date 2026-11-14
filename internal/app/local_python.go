@@ -478,7 +478,12 @@ func runLocalPythonSnapshotOnce(ctx context.Context, cfg LocalPythonConfig, path
 	apiSock := filepath.Join(workDir, "firecracker.socket")
 	logPath := filepath.Join(workDir, "firecracker.log")
 	cmd := exec.CommandContext(ctx, localPythonFirecrackerBinary(cfg), "--api-sock", apiSock, "--log-path", logPath)
-	extraFiles, closeExtraFiles, err := localPythonFirecrackerExtraFiles(cfg, paths.WorkspacePath, paths.SwapPath)
+	// A warm baseline can contain swapped pages. Requests must not overwrite it.
+	swapPath, err := localPythonRestoreSwap(ctx, cfg, paths, workDir)
+	if err != nil {
+		return 0, fmt.Errorf("copy warm snapshot swap: %w", err)
+	}
+	extraFiles, closeExtraFiles, err := localPythonFirecrackerExtraFiles(cfg, paths.WorkspacePath, swapPath)
 	if err != nil {
 		return 0, err
 	}
@@ -807,13 +812,13 @@ func runLocalPythonBenchmarkOnce(ctx context.Context, cfg LocalPythonConfig, pat
 
 func localPythonSnapshotStdin(cfg LocalPythonConfig, execSource string, stdin io.Reader) io.Reader {
 	if execSource == "" {
-		setup := strings.NewReader("exec(" + strconv.Quote("import subprocess\n"+localPythonWorkspaceSetup) + ")\n")
+		setup := strings.NewReader("exec(" + strconv.Quote("import subprocess\n"+localPythonWarmRestore(cfg.ImportProfile)+localPythonWorkspaceSetup) + ")\n")
 		if stdin == nil {
 			return setup
 		}
 		return io.MultiReader(setup, stdin)
 	}
-	return strings.NewReader(localPythonExecInput(execSource, localPythonExecFilename(cfg), !cfg.SkipGuestWorkspaceSync))
+	return strings.NewReader(localPythonExecInputForProfile(execSource, localPythonExecFilename(cfg), !cfg.SkipGuestWorkspaceSync, cfg.ImportProfile))
 }
 
 func localPythonExecSource(cfg LocalPythonConfig) (string, error) {
@@ -845,8 +850,12 @@ const localPythonWorkspaceSetup = "subprocess.run(['/usr/sbin/blockdev', '--flus
 	"subprocess.run(['/usr/bin/chmod', '-R', 'u+rwX', '/workspace'], check=True)\n"
 
 func localPythonExecInput(source, filename string, syncWorkspace bool) string {
+	return localPythonExecInputForProfile(source, filename, syncWorkspace, "")
+}
+
+func localPythonExecInputForProfile(source, filename string, syncWorkspace bool, profile string) string {
 	encoded := base64.StdEncoding.EncodeToString([]byte(source))
-	input := "import base64, os, subprocess\n" +
+	input := "import base64, os, subprocess\n" + localPythonWarmRestore(profile) +
 		localPythonWorkspaceSetup +
 		"os.environ['HOME'] = '/workspace'\n" +
 		"os.environ['TMPDIR'] = '/workspace'\n" +
@@ -877,6 +886,7 @@ func localPythonPrepareSnapshotInput(cfg LocalPythonConfig) string {
 		builder.WriteString("subprocess.run(['/usr/sbin/mkswap', '/dev/vdc'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
 		builder.WriteString("subprocess.run(['/usr/sbin/swapon', '/dev/vdc'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
 	}
+	builder.WriteString(localPythonWarmImports(cfg.ImportProfile))
 	// Do not put the complete marker in serial input: the guest TTY can echo it
 	// before executing the block, which would report readiness before setup.
 	builder.WriteString("print('__NATS_' + 'SANDBOX_RUNTIME_SNAPSHOT_READY__', flush=True)\n")
@@ -1059,7 +1069,11 @@ func localPythonSnapshotPaths(snapshotDir string) localPythonSnapshotFiles {
 }
 
 func localPythonSnapshotPathsForConfig(cfg LocalPythonConfig) localPythonSnapshotFiles {
-	paths := localPythonSnapshotPaths(cfg.SnapshotDir)
+	dir := cfg.SnapshotDir
+	if cfg.ImportProfile != "" {
+		dir = filepath.Join(dir, "profiles", cfg.ImportProfile+"-"+localPythonImportProfileVersion)
+	}
+	paths := localPythonSnapshotPaths(dir)
 	if cfg.WorkspaceImagePath != "" {
 		paths.WorkspacePath = cfg.WorkspaceImagePath
 	}
@@ -1105,6 +1119,9 @@ func localPythonSnapshotVersion(cfg LocalPythonConfig) string {
 		firecracker = resolved
 	}
 	version := fmt.Sprintf("workspace-v8 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 root_device_ro=1 workspace_mount=on_restore user_uid=65534 kernel=%s rootfs=%s firecracker=%s", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB, localPythonSnapshotAssetVersion(cfg.KernelPath), localPythonSnapshotRootfsVersion(cfg.RootfsPath), localPythonSnapshotAssetVersion(firecracker))
+	if cfg.ImportProfile != "" {
+		version += " import_profile=" + cfg.ImportProfile + "-" + localPythonImportProfileVersion
+	}
 	if cfg.SparseBootSnapshot {
 		version += " sparse_boot_snapshot=1"
 	}

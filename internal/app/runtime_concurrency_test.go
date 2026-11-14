@@ -329,6 +329,42 @@ func TestNATSPanicFailureAndInvalidPrefixReleaseWorker(t *testing.T) {
 	}
 }
 
+func TestNATSImportProfileValidationAndForwarding(t *testing.T) {
+	profiles := make(chan string, 3)
+	_, nc := concurrencyRuntime(t, 1, func(_ context.Context, cfg LocalPythonConfig) (LocalPythonExecResult, error) {
+		profiles <- cfg.ImportProfile
+		return LocalPythonExecResult{}, nil
+	})
+	for _, profile := range []string{"../escape", "unknown", "", "numpy", "plot-agg"} {
+		data, err := json.Marshal(PythonRunRequest{Code: "fixture", ImportProfile: profile})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := nc.Request(runtimePythonEndpointSubject, data, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		invalid := profile == "../escape" || profile == "unknown"
+		if invalid {
+			if msg.Header.Get(micro.ErrorCodeHeader) != "400" {
+				t.Fatalf("invalid profile response: %v", msg)
+			}
+			select {
+			case got := <-profiles:
+				t.Fatalf("invalid profile reached execution: %q", got)
+			default:
+			}
+			continue
+		}
+		if msg.Header.Get(micro.ErrorCodeHeader) != "" {
+			t.Fatalf("valid profile response: %v", msg)
+		}
+		if got := <-profiles; got != profile {
+			t.Fatalf("profile = %q, want %q", got, profile)
+		}
+	}
+}
+
 func TestDrainDeadlinesAndCancellableWorkspace(t *testing.T) {
 	for _, finishAfter := range []time.Duration{20 * time.Second, 31 * time.Second} {
 		t.Run(finishAfter.String(), func(t *testing.T) {

@@ -2,6 +2,8 @@ import os, json, time, hashlib, sys
 assert __debug__ and sys.flags.optimize==0
 assert not hasattr(sys, "_is_gil_enabled") or sys._is_gil_enabled()
 from pathlib import Path
+loaded_numpy='numpy' in sys.modules
+loaded_pyplot='matplotlib.pyplot' in sys.modules
 assert os.statvfs('/').f_flag & os.ST_RDONLY
 assert not os.statvfs('/workspace').f_flag & os.ST_RDONLY
 assert os.getuid()==65534 and os.getcwd()=='/workspace'
@@ -14,7 +16,7 @@ inputs={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('artifac
 payload_bytes=0
 import_ms=0
 backend=''
-extra={"version":sys.version,"optimize":sys.flags.optimize,"debug":__debug__,"jit_available":bool(hasattr(sys,"_jit") and sys._jit.is_available()),"jit_enabled":bool(hasattr(sys,"_jit") and sys._jit.is_enabled())}
+extra={"loaded_numpy":loaded_numpy,"loaded_pyplot":loaded_pyplot,"version":sys.version,"optimize":sys.flags.optimize,"debug":__debug__,"jit_available":bool(hasattr(sys,"_jit") and sys._jit.is_available()),"jit_enabled":bool(hasattr(sys,"_jit") and sys._jit.is_enabled())}
 
 if mode=='audit':
     import sys,sysconfig,importlib.util,importlib.metadata,struct,ctypes,glob
@@ -70,6 +72,19 @@ if mode in ('blas','blas1'):
     extra['blas_ms']=(time.perf_counter()-t)*1000
     assert np.isclose(b[0,0],sum((i/1000)**2 for i in range(640)),rtol=1e-12)
 
+if mode=='state':
+    import numpy as np, random
+    assert not hasattr(np,'_prior_user')
+    np._prior_user=thread
+    extra['random_values']=[random.random(),float(np.random.random()),float(np.random.default_rng().random()),os.urandom(16).hex()]
+    random.seed(42);np.random.seed(42)
+    assert random.random()==0.6394267984578837 and np.isclose(np.random.random(),0.3745401188473625)
+    if profile=='plot-agg':
+        import matplotlib.pyplot as plt
+        assert not plt.get_fignums()
+        assert plt.rcParams['lines.linewidth']==1.5
+        plt.rcParams['lines.linewidth']=33
+        plt.figure()
 if mode=='backend':
     import importlib
     module='caller_module_'+str(run_id)
@@ -87,12 +102,20 @@ if mode=='io':
     payload_bytes=8*1024*1024
 if mode=='plot':
     os.environ['MPLBACKEND']='Agg'
-    os.environ['MPLCONFIGDIR']='/workspace/artifacts/mplconfig'
+    if profile!='plot-agg': os.environ['MPLCONFIGDIR']='/workspace/artifacts/mplconfig'
     t=time.perf_counter()
     import matplotlib.pyplot as plt
     import_ms=(time.perf_counter()-t)*1000
-    plt.plot(range(1000),[i*i for i in range(1000)])
-    plt.savefig('outputs/chart.png');plt.close()
+    axes_ms=save_ms=0
+    for chart in range(charts):
+        t=time.perf_counter()
+        plt.plot(range(1000),[i*i+chart*i for i in range(1000)])
+        axes_ms+=(time.perf_counter()-t)*1000
+        t=time.perf_counter()
+        plt.savefig('outputs/chart-'+str(chart)+'.png',pil_kwargs={'compress_level':compression});plt.close()
+        save_ms+=(time.perf_counter()-t)*1000
+    extra.update(axes_ms=axes_ms,save_ms=save_ms)
+    extra['plot_backend']=plt.get_backend()
 stats={}
 for line in open('/proc/self/status'):
     key,_,value=line.partition(':')
