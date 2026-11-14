@@ -81,6 +81,38 @@ func TestRunEnforcesInputSizeLimits(t *testing.T) {
 	})
 }
 
+func TestImportProfilesAreOptInAndValidateBeforeUpload(t *testing.T) {
+	for _, profile := range []string{"", ImportProfileNumPy, ImportProfilePlotAgg} {
+		client := newTestClient(Config{})
+		client.req = &fakeRequester{handle: func(_ string, data []byte) *nats.Msg {
+			var wire map[string]json.RawMessage
+			if err := json.Unmarshal(data, &wire); err != nil {
+				t.Fatal(err)
+			}
+			_, present := wire["import_profile"]
+			if present != (profile != "") {
+				t.Fatalf("profile presence=%t", present)
+			}
+			var req pythonRunRequest
+			if err := json.Unmarshal(data, &req); err != nil {
+				t.Fatal(err)
+			}
+			if req.ImportProfile != profile {
+				t.Fatalf("profile=%q", req.ImportProfile)
+			}
+			return runtimeResponse(req.RunID, nil)
+		}}
+		if _, err := client.Run(t.Context(), Request{ThreadID: "thread", Code: "pass", ImportProfile: profile}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := newTestClient(Config{})
+	_, err := client.Run(t.Context(), Request{ThreadID: "thread", Code: "pass", ImportProfile: "../escape", Files: map[string][]byte{"a": {1}}})
+	if err == nil || len(client.store.(*fakeStore).puts) != 0 {
+		t.Fatal("invalid profile uploaded inputs")
+	}
+}
+
 func TestRunUploadsInputsAndSendsRuntimeWireRequest(t *testing.T) {
 	store := newFakeStore()
 	requester := &fakeRequester{

@@ -44,6 +44,39 @@ The build downloads the Firecracker release binary and Firecracker CI guest asse
 
 Python modules available inside the Firecracker guest are declared in the repo-root `requirements.txt`; the Docker build installs those requirements into the packaged guest rootfs.
 
+Python requests can opt into `import_profile: "numpy"` or `"plot-agg"` to restore
+trusted library imports from a pristine snapshot. Omit the field for the original
+generic interpreter, including scripts that depend on workspace-local modules,
+custom Matplotlib configuration or backend environment selection. Go callers use
+`pyruntime.Request.ImportProfile` with `ImportProfileNumPy` or `ImportProfilePlotAgg`.
+Older runtimes may ignore this optional field and execute with cold imports.
+
+`numpy` preloads NumPy and its random module. `plot-agg` also preloads pyplot,
+initializes the Agg renderer and bundled/system font cache, then closes all figures.
+The plotting preset uses `/tmp/nats-plot-cache` on a private writable tmpfs; backend
+and import-time configuration are fixed before the request. Late `MPLBACKEND` or
+`MPLCONFIGDIR` changes do not reinitialize preloaded Matplotlib. Choose generic
+execution when those semantics are required. These profiles reserve their imported
+module names; use generic execution to shadow them with workspace modules.
+
+Every job restores a clean baseline. No user code or mounted workspace enters the
+cached snapshot; mutable globals, rcParams and figures cannot survive to another
+job. Each warm restore receives fresh host entropy, reseeds the private guest kernel
+and the preloaded Python/NumPy generators, then mounts the current workspace and
+drops privileges normally. Explicit application seeds remain deterministic. Profile
+cache paths and identities are distinct; the generic cache identity is unchanged.
+Warm jobs also receive a private copy of the snapshot's swap image, preserving
+preloaded pages in the cached baseline across requests. Resetting a worker's
+snapshot cache removes all its profiles while retaining thread workspaces.
+
+Warm snapshots trade startup work and additional cached pages/disk space for lower
+repeated import cost. Benchmark peak memory and swap at the existing resource limits
+before selecting a profile. No import profile is enabled globally or automatically.
+
+Generate related figures in one request to amortize restore and transfer costs.
+The benchmark in `scripts/python-bench` compares single plots, four-plot batches,
+import profiles and lossless PNG compression without changing application defaults.
+
 An optional `Dockerfile.guest-python` builds a checksum-pinned CPython source
 release with PGO and LTO on top of an existing runtime image. The normal image
 continues to use Ubuntu's interpreter. For example:

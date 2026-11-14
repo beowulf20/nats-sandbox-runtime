@@ -216,6 +216,16 @@ func TestRuntimeAPIHTTPSnapshotHandlers(t *testing.T) {
 	writeRuntimeAPITestSparseFile(t, paths.SwapPath, cfg.LocalPython.SwapMiB*1024*1024)
 	writeRuntimeAPITestFile(t, paths.VersionPath, localPythonSnapshotVersion(cfg.LocalPython)+"\n")
 	writeRuntimeAPITestFile(t, paths.WorkspacePath, "workspace")
+	var warmFiles []string
+	for _, profile := range []string{"numpy", "plot-agg"} {
+		warmCfg := runtimeStorageWorkerConfig(pool, worker)
+		warmCfg.ImportProfile = profile
+		warm := localPythonSnapshotPathsForConfig(warmCfg)
+		for _, path := range []string{warm.StatePath, warm.MemoryPath, warm.VersionPath, warm.SwapPath} {
+			writeRuntimeAPITestFile(t, path, "warm baseline")
+			warmFiles = append(warmFiles, path)
+		}
+	}
 
 	handler := newRuntimeAPIHTTPHandler(NewRuntimeControlPlane(nil), pool, NewRuntimeWorkspaceManager(cfg.LocalPython.SnapshotDir), staticRuntimeAPIOverviewProvider{}, t.TempDir())
 	listReq := httptest.NewRequest(http.MethodGet, "/api/snapshots", nil)
@@ -238,7 +248,7 @@ func TestRuntimeAPIHTTPSnapshotHandlers(t *testing.T) {
 	if deleteResp.Code != http.StatusOK {
 		t.Fatalf("DELETE snapshot status = %d body = %s, want 200", deleteResp.Code, deleteResp.Body.String())
 	}
-	for _, path := range []string{paths.StatePath, paths.MemoryPath, paths.VersionPath, paths.SwapPath} {
+	for _, path := range append(warmFiles, paths.StatePath, paths.MemoryPath, paths.VersionPath, paths.SwapPath) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("snapshot file %s exists after delete, err=%v", path, err)
 		}

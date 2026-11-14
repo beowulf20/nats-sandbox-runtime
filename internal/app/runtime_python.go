@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"nats-sandbox-runtime/internal/observability"
+	"nats-sandbox-runtime/internal/pythonprofile"
 	"nats-sandbox-runtime/internal/transfer"
 	"os"
 	"path/filepath"
@@ -43,6 +44,7 @@ const (
 )
 
 type PythonRunRequest struct {
+	ImportProfile           string                   `json:"import_profile,omitempty"`
 	ArtifactExcludePrefixes []string                 `json:"artifact_exclude_prefixes,omitempty"`
 	RunID                   string                   `json:"run_id,omitempty"`
 	ThreadID                string                   `json:"thread_id,omitempty"`
@@ -364,6 +366,12 @@ func (s *runtimePythonService) handleAccepted(ctx context.Context, req micro.Req
 		_ = req.Error("400", "invalid artifact exclusion prefixes", nil)
 		return
 	}
+	if err := pythonprofile.Validate(runReq.ImportProfile); err != nil {
+		failed = true
+		attempted = true
+		_ = req.Error("400", "invalid import profile", nil)
+		return
+	}
 	if runReq.RunID == "" {
 		runReq.RunID = nats.NewInbox()[5:]
 	}
@@ -580,6 +588,7 @@ func (s *runtimePythonService) localPythonConfigForRunContext(ctx context.Contex
 			return LocalPythonConfig{}, err
 		}
 	}
+	cfg.ImportProfile = runReq.ImportProfile
 	cfg.InlineCommand = code
 	cfg.ExecFilePath = ""
 	cfg.WorkspaceDir = workspaceDir

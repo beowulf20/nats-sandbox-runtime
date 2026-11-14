@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"nats-sandbox-runtime/internal/pythonprofile"
 	"nats-sandbox-runtime/internal/transfer"
 	"path"
 	"sort"
@@ -51,8 +52,15 @@ type Client struct {
 	cfg   Config
 }
 
+const (
+	ImportProfileNumPy   = pythonprofile.NumPy
+	ImportProfilePlotAgg = pythonprofile.PlotAgg
+)
+
 // Request is the V0 byte-only runtime request.
 type Request struct {
+	// ImportProfile opts into trusted preloaded modules; empty preserves generic semantics.
+	ImportProfile           string
 	ArtifactExcludePrefixes []string
 	ThreadID                string
 	Code                    string
@@ -128,6 +136,9 @@ func (c *Client) Run(ctx context.Context, req Request) (*Result, error) {
 	if strings.TrimSpace(req.Code) == "" {
 		return nil, fmt.Errorf("code must not be empty")
 	}
+	if err := pythonprofile.Validate(req.ImportProfile); err != nil {
+		return nil, err
+	}
 	files, err := validateInputFiles(req.Files, cfg)
 	if err != nil {
 		return nil, err
@@ -155,6 +166,7 @@ func (c *Client) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 
 	wireReq := pythonRunRequest{
+		ImportProfile:           req.ImportProfile,
 		ArtifactExcludePrefixes: req.ArtifactExcludePrefixes,
 		RunID:                   runID,
 		ThreadID:                strings.TrimSpace(req.ThreadID),
@@ -207,6 +219,7 @@ type objectStore interface {
 }
 
 type pythonRunRequest struct {
+	ImportProfile           string                   `json:"import_profile,omitempty"`
 	ArtifactExcludePrefixes []string                 `json:"artifact_exclude_prefixes,omitempty"`
 	RunID                   string                   `json:"run_id"`
 	ThreadID                string                   `json:"thread_id"`
