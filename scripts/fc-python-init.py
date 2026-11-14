@@ -58,7 +58,14 @@ def main():
         result = subprocess.run(["/usr/bin/python3", "-c", command], check=False)
     else:
         console_print("python repl ready")
-        result = subprocess.run(["/usr/bin/python3", "-i"], check=False)
+        # The serial transport sends complete commands, without terminal editing.
+        # Python 3.13+ otherwise selects PyREPL and retains terminal input state
+        # across snapshot restores.
+        result = subprocess.run(
+            ["/usr/bin/python3", "-i"],
+            check=False,
+            env={**os.environ, "PYTHON_BASIC_REPL": "1"},
+        )
 
     runtime_ms = (time.time_ns() - runtime_start_ns) // 1_000_000
     console_print(f"vm runtime_ms={runtime_ms}")

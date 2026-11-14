@@ -44,6 +44,35 @@ The build downloads the Firecracker release binary and Firecracker CI guest asse
 
 Python modules available inside the Firecracker guest are declared in the repo-root `requirements.txt`; the Docker build installs those requirements into the packaged guest rootfs.
 
+An optional `Dockerfile.guest-python` builds a checksum-pinned CPython source
+release with PGO and LTO on top of an existing runtime image. The normal image
+continues to use Ubuntu's interpreter. For example:
+
+```bash
+docker build -f Dockerfile.guest-python \
+  --build-arg RUNTIME_IMAGE=nats-sandbox-runtime:local \
+  --build-arg PYTHON_VERSION=3.14.10 \
+  --build-arg PYTHON_SHA256=de414a57119abef52784d8993e341d53aed635fc2b05c2607d9f98a2c5b72032 \
+  -t nats-sandbox-runtime:python-pgo .
+```
+
+Use a maintained release and its checksum from python.org. This derivative
+is tested with the packaged Ubuntu 24.04 guest. It preserves installed library versions
+(including setuptools and wheel); pip comes from the selected CPython bundle:
+the same Python minor version reuses existing libraries; a different minor
+version installs matching binary wheels, failing if unavailable. Added compiler packages stay
+in the build stage. Python assertions, docstrings and lazy imports remain enabled;
+no JIT, tail-call interpreter or GIL options are changed. The guest uses the basic
+REPL because the snapshot serial transport sends commands without terminal editing.
+New bytecode is prepared without importing plotting libraries, so callers can still
+select their plotting backend and import workspace modules.
+
+Source builds and the additional image layer can increase disk usage. Check
+latency, throughput, peak memory and swap under representative concurrent work
+before choosing an interpreter. Building this image does not alter a running
+deployment or its resource settings. See [the KVM benchmark](scripts/python-bench/README.md)
+for a repeatable isolated comparison.
+
 `GUEST_ROOTFS_SIZE` is the filesystem capacity used while preparing the guest.
 The build checks and shrinks the completed read-only filesystem before computing
 its checksum and copying it into the final image. The packaged root disk can
