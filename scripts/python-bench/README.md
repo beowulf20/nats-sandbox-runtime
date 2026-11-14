@@ -84,6 +84,19 @@ The client saves the first PNG per phase under `images/` and checks its dimensio
 Compare input data hashes and inspect images across renderers; exact pixel hashes
 are useful within a renderer, while Agg/Cairo differences require visual checks.
 
+Use `--plot-styles default fast` to pair ordinary and `plt.style.use("fast")`
+requests within the same fresh runtime. Rotate style order between trials.
+Only the explicit `fast` requests change simplification/chunking; no service
+default is changed. The fixture asserts default path settings before each request
+applies its style, detecting state leaked from an earlier fast request. It records
+the actual threshold/chunk size, style setup time, input checksum time, package
+metadata time and data preparation time. Fast style may change fine line detail
+and marker rendering (observed in Cairo scatter output);
+compare data hashes and inspect the separately saved PNGs before choosing it.
+Timed plotting uses already-imported module version attributes rather than
+importing `importlib.metadata` for package lookups on every request. The separate
+`audit` workload retains complete distribution metadata outside plot comparisons.
+
 All requests check read-only root, writable workspace, UID 65534, Python
 assertions, thread identity and file exclusions. Input content changes on each
 batch and each lane to detect stale workspace results. The `backend` check also

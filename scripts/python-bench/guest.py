@@ -12,7 +12,9 @@ if marker.exists(): assert marker.read_text()==thread
 marker.write_text(thread)
 os.makedirs('outputs',exist_ok=True)
 started=time.perf_counter()
+input_hash_started=time.perf_counter()
 inputs={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('artifacts').glob('*') if p.is_file()}
+input_hash_ms=(time.perf_counter()-input_hash_started)*1000
 payload_bytes=0
 import_ms=0
 backend=''
@@ -107,12 +109,22 @@ if mode=='plot':
     t=time.perf_counter()
     import matplotlib.pyplot as plt
     import_ms=(time.perf_counter()-t)*1000
-    import numpy as np, importlib.metadata
+    metadata_started=time.perf_counter()
+    import numpy as np, matplotlib
     if renderer=='cairo':
         import cairo, mplcairo
-        extra.update(cairo_version=cairo.cairo_version_string(),mplcairo_version=importlib.metadata.version('mplcairo'),cairo_options={k:str(v) for k,v in mplcairo.get_options().items()})
-    extra.update(numpy_version=np.__version__,matplotlib_version=importlib.metadata.version('matplotlib'))
+        extra.update(cairo_version=cairo.cairo_version_string(),mplcairo_version=getattr(mplcairo,'__version__','unknown'),cairo_options={k:str(v) for k,v in mplcairo.get_options().items()})
+    extra.update(numpy_version=np.__version__,matplotlib_version=matplotlib.__version__)
+    extra['version_metadata_ms']=(time.perf_counter()-metadata_started)*1000
+    for param in ['path.simplify','path.simplify_threshold','agg.path.chunksize']:
+        assert plt.rcParams[param]==matplotlib.rcParamsDefault[param], 'style leaked across restores'
+    style_started=time.perf_counter()
+    if plot_style=='fast': plt.style.use('fast')
+    extra.update(plot_style=plot_style,style_ms=(time.perf_counter()-style_started)*1000,
+                 simplify=plt.rcParams['path.simplify'],simplify_threshold=plt.rcParams['path.simplify_threshold'],
+                 path_chunksize=plt.rcParams['agg.path.chunksize'])
     assert plt.get_backend().lower()==selected_backend.lower()
+    data_started=time.perf_counter()
     rng=np.random.default_rng(12345)
     if plot_type=='scatter':
         x=rng.normal(size=5000);y=0.4*x+rng.normal(scale=0.5,size=5000)
@@ -121,6 +133,7 @@ if mode=='plot':
     else:
         x=np.linspace(0,6*np.pi,2000);y=np.sin(x)+0.2*np.cos(3*x)
     data_hash=hashlib.sha256(np.column_stack((x,y)).astype('<f8').tobytes()).hexdigest()
+    extra['data_prepare_ms']=(time.perf_counter()-data_started)*1000
     axes_ms=save_ms=draw_ms=0
     titles=[]
     for chart in range(charts):
@@ -158,5 +171,5 @@ for line in open('/proc/vmstat'):
     key,value=line.split()
     if key in ('pgmajfault','pswpin','pswpout'): stats[key]=int(value)
 stats.update(extra)
-stats.update(backend=backend,input_hashes=inputs,payload_bytes=payload_bytes,import_ms=import_ms,processing_ms=(time.perf_counter()-started)*1000)
+stats.update(backend=backend,input_hashes=inputs,input_hash_ms=input_hash_ms,payload_bytes=payload_bytes,import_ms=import_ms,processing_ms=(time.perf_counter()-started)*1000)
 Path('outputs/metrics.json').write_text(json.dumps(stats))

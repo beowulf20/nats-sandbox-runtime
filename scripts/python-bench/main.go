@@ -52,6 +52,7 @@ func main() {
 	profile := flag.String("import-profile", "", "empty, numpy, plot-agg, plot-cairo")
 	renderer := flag.String("renderer", "agg", "agg or cairo")
 	plotType := flag.String("plot-type", "line", "line, scatter or dense")
+	plotStyle := flag.String("plot-style", "default", "default or fast")
 	saveDir := flag.String("save-dir", "", "optional directory for first plot output")
 	charts := flag.Int("charts", 1, "charts per plot request")
 	compression := flag.Int("png-compression", 6, "PNG compression 0 through 9")
@@ -61,6 +62,9 @@ func main() {
 	}
 	if (*renderer != "agg" && *renderer != "cairo") || (*plotType != "line" && *plotType != "scatter" && *plotType != "dense") {
 		panic("invalid renderer or plot type")
+	}
+	if *plotStyle != "default" && *plotStyle != "fast" {
+		panic("invalid plot style")
 	}
 	if (*profile == pyruntime.ImportProfilePlotAgg && *renderer != "agg") || (*profile == pyruntime.ImportProfilePlotCairo && *renderer != "cairo") {
 		panic("renderer conflicts with warm profile")
@@ -111,7 +115,7 @@ func main() {
 					}
 				}
 				thread := fmt.Sprintf("lane-%d", lane)
-				code := fmt.Sprintf("thread=%q\nmode=%q\nrun_id=%d\nprofile=%q\ncharts=%d\ncompression=%d\nrenderer=%q\nplot_type=%q\n", thread, mode, rep, *profile, *charts, *compression, *renderer, *plotType) + "from pathlib import Path\nexec(compile(Path('artifacts/benchmark.py').read_text(), 'artifacts/benchmark.py', 'exec'), globals())\n"
+				code := fmt.Sprintf("thread=%q\nmode=%q\nrun_id=%d\nprofile=%q\ncharts=%d\ncompression=%d\nrenderer=%q\nplot_type=%q\nplot_style=%q\n", thread, mode, rep, *profile, *charts, *compression, *renderer, *plotType, *plotStyle) + "from pathlib import Path\nexec(compile(Path('artifacts/benchmark.py').read_text(), 'artifacts/benchmark.py', 'exec'), globals())\n"
 				result, err := c.Run(ctx, pyruntime.Request{ImportProfile: *profile, ThreadID: thread, Code: code, Files: files, ArtifactExcludePrefixes: []string{"artifacts/"}})
 				r["elapsed_ms"] = float64(time.Since(runStart)) / float64(time.Millisecond)
 				if err != nil {
