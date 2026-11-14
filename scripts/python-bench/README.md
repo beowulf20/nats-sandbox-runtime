@@ -34,6 +34,21 @@ keeping the inline serial command short. This avoids conflating long-console-inp
 corruption with renderer or snapshot performance. The script is excluded from
 returned artifacts with other request inputs.
 
+The pristine snapshot compiles the trusted execution wrapper once. Each restore
+sends request arguments and fresh entropy for warm import profiles; user code
+still compiles after workspace setup and privilege dropping. A snapshot version
+change rebuilds older caches. Cold warmup includes this preparation, so compare
+it separately from measured warm requests.
+Warm import profiles also collect trusted warmup garbage before snapshotting;
+user executions retain normal garbage collection and thresholds.
+
+`processing_ms` starts after the benchmark file loader, source compilation and
+initial assertions. It also ends before metrics serialization and writing.
+Subtracting it from server duration includes this benchmark work as well as
+runtime lifecycle costs; use phase measurements to distinguish them.
+Request results include `run_id` to correlate with internal `runtime.run.completed`
+logs without exposing timing probes in service responses.
+
 Available workloads:
 
 | Workload | Checks and measurements |

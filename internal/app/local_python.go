@@ -746,7 +746,7 @@ func runLocalPythonBenchmarkOnce(ctx context.Context, cfg LocalPythonConfig, pat
 	}
 	defer closeExtraFiles()
 	cmd.ExtraFiles = extraFiles
-	cmd.Stdin = strings.NewReader(localPythonExecInput(execSource+"\nprint("+strconv.Quote(marker)+")\n", localPythonExecFilename(cfg), true))
+	cmd.Stdin = strings.NewReader(localPythonExecInputForProfile(execSource+"\nprint("+strconv.Quote(marker)+")\n", localPythonExecFilename(cfg), true, cfg.ImportProfile))
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return localPythonBenchmarkRun{}, fmt.Errorf("create benchmark stdout pipe: %w", err)
@@ -855,31 +855,40 @@ func localPythonExecInput(source, filename string, syncWorkspace bool) string {
 
 func localPythonExecInputForProfile(source, filename string, syncWorkspace bool, profile string) string {
 	encoded := base64.StdEncoding.EncodeToString([]byte(source))
-	input := "import base64, os, subprocess\n" + localPythonWarmRestore(profile) +
+	syncArg := "False"
+	if syncWorkspace {
+		syncArg = "True"
+	}
+	return "__nats_runtime_exec(" + strconv.Quote(encoded) + ", " + strconv.Quote(filename) + ", " + syncArg + ", " + strconv.Quote(localPythonRestoreSeed(profile)) + ")\n"
+}
+
+// Compile trusted setup once into the pristine snapshot. Each restore sends
+// only request arguments, reducing serial input and repeated wrapper parsing.
+// User code is still compiled after workspace setup and privilege dropping.
+func localPythonExecHelper(profile string) string {
+	input := localPythonWarmRestoreWithSeed(profile, "seed") +
 		localPythonWorkspaceSetup +
 		"os.environ['HOME'] = '/workspace'\n" +
 		"os.environ['TMPDIR'] = '/workspace'\n" +
 		"os.chdir('/workspace')\n" +
-		"__nats_code = base64.b64decode(" + strconv.Quote(encoded) + ").decode('utf-8')\n" +
+		"__nats_code = base64.b64decode(encoded).decode('utf-8')\n" +
 		"try:\n" +
 		"    os.setgroups([])\n" +
 		"    os.setgid(65534)\n" +
 		"    os.setuid(65534)\n" +
-		"    exec(compile(__nats_code, " + strconv.Quote(filename) + ", 'exec'), {'__name__': '__main__', '__file__': " + strconv.Quote(filename) + "})\n" +
-		"finally:\n"
-	if syncWorkspace {
-		input += "    subprocess.run(['/usr/bin/sync'], check=False)\n"
-	} else {
-		input += "    pass\n"
-	}
-	input += "\nraise SystemExit\n"
-	// Setup errors must prevent privilege dropping and user-code execution.
-	return "exec(" + strconv.Quote(input) + ")\n"
+		"    exec(compile(__nats_code, filename, 'exec'), {'__name__': '__main__', '__file__': filename})\n" +
+		"finally:\n" +
+		"    if sync_workspace:\n" +
+		"        subprocess.run(['/usr/bin/sync'], check=False)\n" +
+		"raise SystemExit\n"
+	return "def __nats_runtime_exec(encoded, filename, sync_workspace, seed):\n" +
+		"    " + strings.ReplaceAll(strings.TrimSuffix(input, "\n"), "\n", "\n    ") + "\n"
 }
 
 func localPythonPrepareSnapshotInput(cfg LocalPythonConfig) string {
 	var builder strings.Builder
-	builder.WriteString("import os, subprocess\n")
+	builder.WriteString("import base64, os, subprocess\n")
+	builder.WriteString(localPythonExecHelper(cfg.ImportProfile))
 	// Leave the workspace unmounted: each restore receives a rebuilt image,
 	// potentially for another thread, with its own UUID and filesystem metadata.
 	if cfg.SwapMiB > 0 {
@@ -887,6 +896,11 @@ func localPythonPrepareSnapshotInput(cfg LocalPythonConfig) string {
 		builder.WriteString("subprocess.run(['/usr/sbin/swapon', '/dev/vdc'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)\n")
 	}
 	builder.WriteString(localPythonWarmImports(cfg.ImportProfile))
+	if cfg.ImportProfile != "" {
+		// Retire trusted warmup garbage and promote surviving imports before
+		// cloning this heap. Keep normal GC behavior during each user job.
+		builder.WriteString("import gc\ngc.collect()\n")
+	}
 	// Do not put the complete marker in serial input: the guest TTY can echo it
 	// before executing the block, which would report readiness before setup.
 	builder.WriteString("print('__NATS_' + 'SANDBOX_RUNTIME_SNAPSHOT_READY__', flush=True)\n")
@@ -1118,7 +1132,7 @@ func localPythonSnapshotVersion(cfg LocalPythonConfig) string {
 	if resolved, err := exec.LookPath(firecracker); err == nil {
 		firecracker = resolved
 	}
-	version := fmt.Sprintf("workspace-v8 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 root_device_ro=1 workspace_mount=on_restore user_uid=65534 kernel=%s rootfs=%s firecracker=%s", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB, localPythonSnapshotAssetVersion(cfg.KernelPath), localPythonSnapshotRootfsVersion(cfg.RootfsPath), localPythonSnapshotAssetVersion(firecracker))
+	version := fmt.Sprintf("workspace-v9 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 root_device_ro=1 workspace_mount=on_restore user_uid=65534 kernel=%s rootfs=%s firecracker=%s", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB, localPythonSnapshotAssetVersion(cfg.KernelPath), localPythonSnapshotRootfsVersion(cfg.RootfsPath), localPythonSnapshotAssetVersion(firecracker))
 	if cfg.ImportProfile != "" {
 		version += " import_profile=" + cfg.ImportProfile + "-" + localPythonImportProfileVersion
 	}

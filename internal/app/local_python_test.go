@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -570,8 +571,8 @@ func TestInvalidateLocalPythonSnapshotRemovesStateMemoryAndVersion(t *testing.T)
 func TestLocalPythonPrepareSnapshotInputLeavesWorkspaceUnmounted(t *testing.T) {
 	got := localPythonPrepareSnapshotInput(LocalPythonConfig{SwapMiB: 64})
 
-	if !containsAll(got, "mkswap", "swapon", "/dev/vdc") || strings.Contains(got, "/dev/vdb") {
-		t.Fatalf("prepare snapshot input = %q, want swap setup and an unmounted workspace", got)
+	if !containsAll(got, "mkswap", "swapon", "/dev/vdc", "def __nats_runtime_exec") || strings.Count(got, "__nats_runtime_exec(") != 1 {
+		t.Fatalf("prepare snapshot input = %q, want swap setup and a defined, uncalled exec helper", got)
 	}
 	if strings.Contains(got, "__NATS_SANDBOX_RUNTIME_SNAPSHOT_READY__") {
 		t.Fatal("serial input contains the readiness marker before setup executes")
@@ -616,7 +617,7 @@ func TestLocalPythonSnapshotCheckRejectsWritableRootDeviceCache(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	oldVersion := strings.Replace(localPythonSnapshotVersion(cfg), "workspace-v8", "workspace-v7", 1)
+	oldVersion := strings.Replace(localPythonSnapshotVersion(cfg), "workspace-v9", "workspace-v7", 1)
 	oldVersion = strings.Replace(oldVersion, " root_device_ro=1 workspace_mount=on_restore", "", 1)
 	if err := os.WriteFile(paths.VersionPath, []byte(oldVersion), 0o644); err != nil {
 		t.Fatal(err)
@@ -702,8 +703,8 @@ func TestLocalPythonSnapshotStartupReapsProcessAndKeepsDiagnosticsPrivate(t *tes
 	}
 }
 
-func TestLocalPythonExecInputMountsCurrentWorkspaceAndMakesTreeWritableByRunner(t *testing.T) {
-	got := localPythonExecInput("pass", "<exec>", false)
+func TestLocalPythonExecHelperMountsCurrentWorkspaceAndMakesTreeWritableByRunner(t *testing.T) {
+	got := localPythonExecHelper("")
 
 	if !containsAll(got, "--flushbufs", "/dev/vdb", "/usr/bin/mount", "chown", "-R", "65534:65534", "/workspace") {
 		t.Fatalf("exec input = %q, want current workspace mounted and writable by runner", got)
@@ -724,8 +725,8 @@ func TestLocalPythonSnapshotStdinMountsWorkspaceBeforeInteractiveInput(t *testin
 	}
 }
 
-func TestLocalPythonExecInputRunsUserCodeUnprivileged(t *testing.T) {
-	got := localPythonExecInput("print('hello')\n", "/workspace/script.py", true)
+func TestLocalPythonExecHelperRunsUserCodeUnprivileged(t *testing.T) {
+	got := localPythonExecHelper("")
 
 	if !containsAll(got, "os.setgid(65534)", "os.setuid(65534)", "os.chdir('/workspace')", "compile(") {
 		t.Fatalf("exec input = %q, want user code to run unprivileged from workspace", got)
@@ -745,6 +746,7 @@ func TestLocalPythonExecInputDoesNotRunUserCodeAfterSetupFailure(t *testing.T) {
 	}
 	input := "import os, subprocess\n" +
 		"subprocess.run = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('workspace setup failed'))\n" +
+		"exec(" + strconv.Quote(localPythonExecHelper("")) + ")\n" +
 		localPythonExecInput("print('USER_CODE_EXECUTED')", "<exec>", false)
 	cmd := exec.CommandContext(t.Context(), python, "-i", "-q")
 	cmd.Stdin = strings.NewReader(input)
@@ -784,19 +786,75 @@ func TestLocalPythonExecSourceReadsScriptFile(t *testing.T) {
 	}
 }
 
-func TestLocalPythonExecInputWrapsSourceAsCompiledScript(t *testing.T) {
-	got := localPythonExecInput("print('hello')\n", "script.py", true)
-
-	if !containsAll(got, "import base64", "compile(", "script.py", "raise SystemExit") {
-		t.Fatalf("exec input = %q, want compiled script wrapper", got)
+func TestLocalPythonCachedExecPreservesScriptAndSyncSemantics(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is required to exercise the cached helper")
+	}
+	for _, syncWorkspace := range []bool{false, true} {
+		for _, fail := range []bool{false, true} {
+			code := "assert __name__ == '__main__'\nassert __file__ == 'script.py'\nassert 'seed' not in globals()\nprint('USER_CODE_EXECUTED')\n"
+			if fail {
+				code += "raise ValueError('user failure')\n"
+			}
+			input := "import base64, os, subprocess, json\nevents=[]\n" +
+				"subprocess.run=lambda args,**kw: events.append(args)\n" +
+				"os.chdir=lambda path: events.append(['chdir',path])\n" +
+				"os.setgroups=lambda groups: events.append(['setgroups',groups])\n" +
+				"os.setgid=lambda gid: events.append(['setgid',gid])\n" +
+				"os.setuid=lambda uid: events.append(['setuid',uid])\n" +
+				localPythonExecHelper("") +
+				"try:\n    " + strings.TrimSpace(localPythonExecInput(code, "script.py", syncWorkspace)) + "\n" +
+				"except (SystemExit,ValueError): pass\nprint(json.dumps(events))\n"
+			cmd := exec.CommandContext(t.Context(), python, "-c", input)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("helper failed: %v: %s", err, output)
+			}
+			if !bytes.HasPrefix(output, []byte("USER_CODE_EXECUTED\n")) {
+				t.Fatalf("script not executed: %s", output)
+			}
+			var events [][]any
+			if err := json.Unmarshal(bytes.TrimSpace(bytes.TrimPrefix(output, []byte("USER_CODE_EXECUTED\n"))), &events); err != nil {
+				t.Fatal(err)
+			}
+			want := [][]any{{"/usr/sbin/blockdev", "--flushbufs", "/dev/vdb"}, {"/usr/bin/mount", "-t", "ext4", "/dev/vdb", "/workspace"},
+				{"/usr/bin/chown", "-R", "65534:65534", "/workspace"}, {"/usr/bin/chmod", "-R", "u+rwX", "/workspace"},
+				{"chdir", "/workspace"}, {"setgroups", []any{}}, {"setgid", float64(65534)}, {"setuid", float64(65534)}}
+			if syncWorkspace {
+				want = append(want, []any{"/usr/bin/sync"})
+			}
+			if !reflect.DeepEqual(events, want) {
+				t.Fatalf("sync=%t failure=%t events=%v, want %v", syncWorkspace, fail, events, want)
+			}
+		}
 	}
 }
 
-func TestLocalPythonExecInputCanSkipGuestSync(t *testing.T) {
-	got := localPythonExecInput("print('hello')\n", "script.py", false)
-
-	if strings.Contains(got, "/usr/bin/sync") {
-		t.Fatalf("exec input = %q, want no guest sync command", got)
+func TestLocalPythonCachedExecInputIsShortAndRejectsPreviousSnapshots(t *testing.T) {
+	for _, profile := range []string{"", "numpy", "plot-agg", "plot-cairo"} {
+		input := localPythonExecInputForProfile("pass", "job.py", true, profile)
+		if len(input) > 256 {
+			t.Fatalf("restore command too long for %s: %d", profile, len(input))
+		}
+		setup := localPythonPrepareSnapshotInput(LocalPythonConfig{ImportProfile: profile, SwapMiB: 256})
+		if len(setup) >= 4096 {
+			t.Fatalf("cold setup command unexpectedly large for %s: %d", profile, len(setup))
+		}
+	}
+	cfg := defaultLocalPythonConfig()
+	paths := localPythonSnapshotPaths(t.TempDir())
+	for _, path := range []string{paths.StatePath, paths.MemoryPath} {
+		if err := os.WriteFile(path, []byte("old"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := strings.Replace(localPythonSnapshotVersion(cfg), "workspace-v9", "workspace-v8", 1)
+	if err := os.WriteFile(paths.VersionPath, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if localPythonSnapshotCheck(paths, cfg).OK {
+		t.Fatal("accepted a snapshot without the cached exec helper")
 	}
 }
 
