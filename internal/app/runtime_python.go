@@ -457,6 +457,10 @@ func (s *runtimePythonService) run(ctx context.Context, worker RuntimeWorker, ru
 			return PythonRunResponse{}, nil, nil, fmt.Errorf("stat workspace %q: %w", workspaceLease.Key, err)
 		}
 	}
+	cfg, err := s.localPythonConfigForRunContext(ctx, worker, runReq, workDir, workspaceDir, workspaceImagePath, "")
+	if err != nil {
+		return PythonRunResponse{}, nil, nil, err
+	}
 	// Reject aliases and overlapping destinations before concurrent writes.
 	seen := map[string]bool{}
 	for _, input := range runReq.Inputs {
@@ -472,7 +476,7 @@ func (s *runtimePythonService) run(ctx context.Context, worker RuntimeWorker, ru
 		seen[p] = true
 	}
 	if err := transfer.Parallel(ctx, len(runReq.Inputs), func(ctx context.Context, i int) error {
-		return fetchRuntimeObject(ctx, s.store, workspaceDir, runReq.Inputs[i])
+		return fetchRuntimeObject(ctx, s.store, workspaceDir, runReq.Inputs[i], cfg.WorkspaceMiB*1024*1024)
 	}); err != nil {
 		return PythonRunResponse{}, nil, nil, err
 	}
@@ -493,10 +497,7 @@ func (s *runtimePythonService) run(ctx context.Context, worker RuntimeWorker, ru
 	startMarker := "__NATS_SANDBOX_RUNTIME_STDOUT_START_" + sanitizeRunIDForMarker(runID) + "__"
 	endMarker := "__NATS_SANDBOX_RUNTIME_STDOUT_END_" + sanitizeRunIDForMarker(runID) + "__"
 	completionMarker := "__NATS_SANDBOX_RUNTIME_COMPLETE_" + sanitizeRunIDForMarker(runID) + "__"
-	cfg, err := s.localPythonConfigForRunContext(ctx, worker, runReq, workDir, workspaceDir, workspaceImagePath, wrapRuntimePythonCode(code, startMarker, endMarker, completionMarker))
-	if err != nil {
-		return PythonRunResponse{}, nil, nil, err
-	}
+	cfg.InlineCommand = wrapRuntimePythonCode(code, startMarker, endMarker, completionMarker)
 	cfg.CompletionMarker = completionMarker
 	cfg.KillAfterCompletion = true
 	cfg.SkipGuestWorkspaceSync = true
@@ -626,7 +627,7 @@ func (s *runtimePythonService) localPythonConfigForRunContext(ctx context.Contex
 	return cfg, nil
 }
 
-func fetchRuntimeObject(ctx context.Context, store jetstream.ObjectStore, workspaceDir string, input PythonRunObjectMapping) error {
+func fetchRuntimeObject(ctx context.Context, store jetstream.ObjectStore, workspaceDir string, input PythonRunObjectMapping, maxBytes int64) error {
 	if input.Object == "" {
 		return fmt.Errorf("input object must not be empty")
 	}
@@ -634,11 +635,55 @@ func fetchRuntimeObject(ctx context.Context, store jetstream.ObjectStore, worksp
 	if err != nil {
 		return err
 	}
-	target := filepath.Join(workspaceDir, rel)
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	stream, err := store.Get(ctx, input.Object)
+	if err != nil {
+		return fmt.Errorf("fetch input object %q: %w", input.Object, err)
+	}
+	defer stream.Close()
+	info, err := stream.Info()
+	if err != nil {
+		return fmt.Errorf("read input object metadata: %w", err)
+	}
+	if maxBytes <= 0 || info == nil || info.Size > uint64(maxBytes) {
+		return fmt.Errorf("input object %q exceeds workspace limit of %d bytes", input.Object, maxBytes)
+	}
+	root, err := os.OpenRoot(workspaceDir)
+	if err != nil {
+		return fmt.Errorf("open input workspace: %w", err)
+	}
+	defer root.Close()
+	if err := root.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
 		return fmt.Errorf("create input object dir: %w", err)
 	}
-	if err := store.GetFile(ctx, input.Object, target); err != nil {
+	temp := filepath.Join(filepath.Dir(rel), ".input-"+nats.NewInbox()[5:])
+	file, err := root.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create input object file: %w", err)
+	}
+	defer root.Remove(temp)
+	defer func() {
+		if file != nil {
+			_ = file.Close()
+		}
+	}()
+	// Stream to a new file: GetFile does not truncate existing destinations,
+	// and an interrupted transfer must not replace a previously valid input.
+	n, copyErr := io.Copy(file, io.LimitReader(stream, maxBytes+1))
+	closeErr := file.Close()
+	file = nil
+	if copyErr != nil {
+		return fmt.Errorf("fetch input object %q: %w", input.Object, copyErr)
+	}
+	if n > maxBytes {
+		return fmt.Errorf("input object %q exceeds workspace limit of %d bytes", input.Object, maxBytes)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close input object file: %w", closeErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := root.Rename(temp, rel); err != nil {
 		return fmt.Errorf("fetch input object %q: %w", input.Object, err)
 	}
 	return nil

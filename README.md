@@ -346,6 +346,13 @@ Stdout and stderr are returned as base64 NATS headers:
 
 The `pkg/pyruntime` SDK wraps the byte-only V0 flow for Go callers. It uploads input bytes to the runtime Object Store bucket, calls `python.run`, and downloads every returned workspace artifact into memory.
 
+Downloads reserve their bounded allocation from Object Store metadata and enforce
+per-file and aggregate byte limits while streaming, including bodies larger than
+their metadata advertises. Streams are consumed through EOF for digest validation.
+Ordinary downloads allocate once from metadata instead of repeatedly growing a
+whole-file buffer. The V0 result still retains the returned file bytes, which
+callers must include in their memory budget.
+
 ```go
 package main
 
