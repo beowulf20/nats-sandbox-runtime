@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+# Optional image derivative. The normal Dockerfile keeps the distro interpreter.
+ARG RUNTIME_IMAGE=nats-sandbox-runtime:local
+FROM ${RUNTIME_IMAGE} AS guest
+USER root
+RUN mkdir /guest \
+ && debugfs -R 'rdump / /guest' /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4 \
+ && chroot /guest /usr/bin/python3 -c 'import importlib.metadata; print("\n".join(sorted(p.metadata["Name"]+"=="+p.version for p in importlib.metadata.distributions() if p.metadata["Name"].lower() not in ("pip","setuptools","wheel"))))' > /guest/tmp/python-packages.txt \
+ && chroot /guest /usr/bin/python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' > /guest/tmp/python-original-version \
+ && chroot /guest /usr/bin/python3 -c 'import site; print("\n".join(site.getsitepackages()))' > /guest/tmp/python-original-sites
+
+FROM guest AS compiler
+ARG PYTHON_VERSION
+ARG PYTHON_SHA256
+ARG PYTHON_BUILD_JOBS=4
+COPY scripts/build-guest-python.sh /guest/tmp/build-guest-python.sh
+RUN cp /etc/resolv.conf /guest/etc/resolv.conf \
+ && for node in null zero random urandom; do test -e /guest/dev/$node || cp -a /dev/$node /guest/dev/$node; done \
+ && chroot /guest /usr/bin/apt-get update \
+ && chroot /guest /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --no-install-recommends build-essential pkg-config curl xz-utils ca-certificates libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev libgdbm-dev libgdbm-compat-dev libncursesw5-dev uuid-dev libexpat1-dev libzstd-dev \
+ && chroot /guest /usr/bin/env PYTHON_VERSION=${PYTHON_VERSION} PYTHON_SHA256=${PYTHON_SHA256} PYTHON_BUILD_JOBS=${PYTHON_BUILD_JOBS} /bin/sh /tmp/build-guest-python.sh
+
+FROM guest AS package
+ARG GUEST_ROOTFS_SIZE=1536M
+COPY --from=compiler /guest/opt/python /guest/opt/python
+COPY --chmod=0755 scripts/fc-python-init.py /guest/usr/local/bin/fc-python-init
+RUN set -eu; \
+ cp /etc/resolv.conf /guest/etc/resolv.conf; \
+ for node in null zero random urandom; do rm -f /guest/dev/$node; cp -a /dev/$node /guest/dev/$node; done; \
+ chroot /guest /usr/bin/apt-get update; \
+ chroot /guest /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --no-install-recommends libgdbm6t64 libgdbm-compat4t64 libzstd1; \
+ chroot /guest /usr/bin/python3 -c 'import importlib.metadata as m; print("\n".join(p.metadata["Name"]+"=="+p.version for p in m.distributions() if p.metadata["Name"].lower() in ("setuptools","wheel")))' >> /guest/tmp/python-packages.txt; \
+ version="$(chroot /guest /opt/python/bin/python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"; \
+ if [ "$version" = "$(cat /guest/tmp/python-original-version)" ]; then \
+   chroot /guest /opt/python/bin/python3 -c 'import pathlib,sysconfig; paths=pathlib.Path("/tmp/python-original-sites").read_text().splitlines(); pathlib.Path(sysconfig.get_path("purelib"),"guest-packages.pth").write_text("import site; "+"; ".join("site.addsitedir("+repr(p)+")" for p in paths)+"\n")'; \
+ else \
+   chroot /guest /opt/python/bin/python3 -m pip install --no-cache-dir --only-binary=:all: -r /tmp/python-packages.txt; \
+ fi; \
+ ln -sf /opt/python/bin/python3 /guest/usr/bin/python3; \
+ chroot /guest /usr/bin/python3 -c 'import ssl,sqlite3,ctypes,bz2,lzma,readline,dbm.gnu,decimal,zlib; assert __debug__'; \
+ chroot /guest /usr/bin/python3 -c 'import importlib,pathlib,sysconfig; [importlib.import_module(p.name.split(".")[0]) for p in pathlib.Path(sysconfig.get_config_var("DESTSHARED")).glob("*.so")]'; \
+ chroot /guest /usr/bin/python3 -c 'import importlib,pathlib; names={line.split("==")[0].lower() for line in pathlib.Path("/tmp/python-packages.txt").read_text().splitlines()}; importlib.import_module("distutils") if "setuptools" in names else None; [importlib.import_module(n) for n in ("setuptools","wheel") if n in names]'; \
+ chroot /guest /usr/bin/python3 -m pip check; \
+ chroot /guest /usr/bin/python3 -m compileall -q -j 4 -x '/(test|tests)/' /opt/python/lib; \
+ chroot /guest /usr/bin/apt-get clean; \
+ rm -rf /guest/var/lib/apt/lists/*; \
+ rm -f /guest/etc/resolv.conf /guest/tmp/python-packages.txt /guest/tmp/python-original-version /guest/tmp/python-original-sites; \
+ mkdir /out; \
+ truncate -s "$GUEST_ROOTFS_SIZE" /out/rootfs.ext4; \
+ mkfs.ext4 -q -F -d /guest /out/rootfs.ext4; \
+ e2fsck -fy /out/rootfs.ext4; \
+ resize2fs -M /out/rootfs.ext4; \
+ e2fsck -fn /out/rootfs.ext4; \
+ sha256sum /out/rootfs.ext4 > /out/rootfs.ext4.sha256
+
+FROM ${RUNTIME_IMAGE}
+COPY --from=package /out/rootfs.ext4 /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4
+COPY --from=package /out/rootfs.ext4.sha256 /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4.sha256
