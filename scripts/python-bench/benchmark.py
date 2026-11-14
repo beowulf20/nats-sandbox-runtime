@@ -66,14 +66,19 @@ def main():
     p.add_argument('--runtime', type=Path, required=True)
     p.add_argument('--client', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--workload', choices=['small', 'cpu', 'io', 'plot', 'blas', 'blas1', 'audit', 'backend'], default='cpu')
+    p.add_argument('--workload', choices=['small', 'cpu', 'io', 'plot', 'blas', 'blas1', 'audit', 'backend', 'state'], default='cpu')
     p.add_argument('--repeats', type=int, default=5)
     p.add_argument('--memory-mib', type=int, default=1024)
     p.add_argument('--guest-memory-mib', type=int, default=128)
     p.add_argument('--keep-snapshots', action='store_true')
+    p.add_argument('--import-profile', choices=['', 'numpy', 'plot-agg'], default='')
+    p.add_argument('--charts', type=int, default=1)
+    p.add_argument('--png-compression', type=int, default=6)
     args = p.parse_args()
     if args.repeats < 1 or args.memory_mib < 1 or args.guest_memory_mib < 1:
         p.error('counts and memory must be positive')
+    if args.charts < 1 or not 0 <= args.png_compression <= 9:
+        p.error('charts must be positive and PNG compression must be 0 through 9')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     state = out / 'snapshots'
@@ -109,7 +114,7 @@ def main():
             raise RuntimeError('runtime readiness timeout')
         (out / 'host-memory-before.txt').write_text(command(['docker', 'exec', name, '/bin/cat', '/proc/meminfo', '/proc/pressure/memory']))
         (out / 'cgroup-start.txt').write_text(cgroup(name))
-        base = [str(args.client.resolve()), '--url', 'nats://127.0.0.1:' + port, '--bucket', bucket, '--parallel', '2']
+        base = [str(args.client.resolve()), '--url', 'nats://127.0.0.1:' + port, '--bucket', bucket, '--parallel', '2', '--import-profile', args.import_profile, '--charts', str(args.charts), '--png-compression', str(args.png_compression)]
         for phase_name, flags in [('warmup', ['--phase', 'warmup', '--repeats', '1']), ('measured', ['--workload', args.workload, '--repeats', str(args.repeats)])]:
             phase[0] = phase_name
             result = subprocess.run(base + flags, text=True, capture_output=True, timeout=360)
