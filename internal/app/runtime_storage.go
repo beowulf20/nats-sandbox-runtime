@@ -83,7 +83,7 @@ func resetRuntimeSnapshot(pool *RuntimeWorkerPool, workerID string) error {
 	if worker.Status == runtimeWorkerBusy {
 		return runtimeStorageConflictError{message: fmt.Sprintf("worker %q is busy", worker.ID)}
 	}
-	for _, profile := range []string{"", pythonprofile.NumPy, pythonprofile.PlotAgg} {
+	for _, profile := range []string{"", pythonprofile.NumPy, pythonprofile.PlotAgg, pythonprofile.PlotCairo} {
 		cfg := runtimeStorageWorkerConfig(pool, worker)
 		cfg.ImportProfile = profile
 		paths := localPythonSnapshotPathsForConfig(cfg)

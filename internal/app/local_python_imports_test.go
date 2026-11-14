@@ -12,7 +12,7 @@ func TestImportProfileCacheIsolation(t *testing.T) {
 	cfg.SnapshotDir = t.TempDir()
 	cfg.WorkspaceImagePath = filepath.Join(t.TempDir(), "thread.ext4")
 	seen := map[string]bool{}
-	for _, profile := range []string{"", "numpy", "plot-agg"} {
+	for _, profile := range []string{"", "numpy", "plot-agg", "plot-cairo"} {
 		cfg.ImportProfile = profile
 		if err := validateLocalPythonConfig(cfg); err != nil {
 			t.Fatal(err)
@@ -61,7 +61,7 @@ func TestWarmSwapWritesCannotChangeBaseline(t *testing.T) {
 	if err := os.WriteFile(base, []byte("baseline swapped pages"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	for _, profile := range []string{"numpy", "plot-agg"} {
+	for _, profile := range []string{"numpy", "plot-agg", "plot-cairo"} {
 		cfg := defaultLocalPythonConfig()
 		cfg.ImportProfile = profile
 		cfg.SwapMiB = 1

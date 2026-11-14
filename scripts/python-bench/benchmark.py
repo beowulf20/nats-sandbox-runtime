@@ -71,7 +71,10 @@ def main():
     p.add_argument('--memory-mib', type=int, default=1024)
     p.add_argument('--guest-memory-mib', type=int, default=128)
     p.add_argument('--keep-snapshots', action='store_true')
-    p.add_argument('--import-profile', choices=['', 'numpy', 'plot-agg'], default='')
+    p.add_argument('--import-profile', choices=['', 'numpy', 'plot-agg', 'plot-cairo'], default='')
+    p.add_argument('--renderer', choices=['agg', 'cairo'], default='agg')
+    p.add_argument('--plot-types', nargs='+', choices=['line', 'scatter', 'dense'], default=['line'])
+    p.add_argument('--plot-styles', nargs='+', choices=['default', 'fast'], default=['default'])
     p.add_argument('--charts', type=int, default=1)
     p.add_argument('--png-compression', type=int, default=6)
     args = p.parse_args()
@@ -79,6 +82,8 @@ def main():
         p.error('counts and memory must be positive')
     if args.charts < 1 or not 0 <= args.png_compression <= 9:
         p.error('charts must be positive and PNG compression must be 0 through 9')
+    if (args.import_profile == 'plot-agg' and args.renderer != 'agg') or (args.import_profile == 'plot-cairo' and args.renderer != 'cairo'):
+        p.error('renderer conflicts with warm profile')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     state = out / 'snapshots'
@@ -93,6 +98,7 @@ def main():
                 output=str(out), started=time.time(), workers=2, parallel=2, guest_swap_mib=256,
                 workspace_mib=64, broker_memory_mib=512, combined_memory_swap_mib=args.memory_mib + 256)
     meta['image'] = args.image
+    meta['fixture_transport'] = 'workspace_file'
     try:
         meta['image_id'] = command(['docker', 'image', 'inspect', args.image, '--format', '{{.Id}}'])
         command(['docker', 'network', 'create', tag])
@@ -114,8 +120,20 @@ def main():
             raise RuntimeError('runtime readiness timeout')
         (out / 'host-memory-before.txt').write_text(command(['docker', 'exec', name, '/bin/cat', '/proc/meminfo', '/proc/pressure/memory']))
         (out / 'cgroup-start.txt').write_text(cgroup(name))
-        base = [str(args.client.resolve()), '--url', 'nats://127.0.0.1:' + port, '--bucket', bucket, '--parallel', '2', '--import-profile', args.import_profile, '--charts', str(args.charts), '--png-compression', str(args.png_compression)]
-        for phase_name, flags in [('warmup', ['--phase', 'warmup', '--repeats', '1']), ('measured', ['--workload', args.workload, '--repeats', str(args.repeats)])]:
+        base = [str(args.client.resolve()), '--url', 'nats://127.0.0.1:' + port, '--bucket', bucket, '--parallel', '2', '--import-profile', args.import_profile, '--renderer', args.renderer, '--charts', str(args.charts), '--png-compression', str(args.png_compression)]
+        phases = [('warmup', ['--phase', 'warmup', '--repeats', '1'])]
+        plot_types = args.plot_types if args.workload == 'plot' else ['line']
+        plot_styles = args.plot_styles if args.workload == 'plot' else ['default']
+        for kind in plot_types:
+            for style in plot_styles:
+                label = 'measured-' + kind if len(plot_types) > 1 else 'measured'
+                image_dir = out / 'images' / kind
+                if len(plot_styles) > 1:
+                    label += '-' + style
+                if len(plot_styles) > 1 or style != 'default':
+                    image_dir /= style
+                phases.append((label, ['--workload', args.workload, '--repeats', str(args.repeats), '--plot-type', kind, '--plot-style', style, '--save-dir', str(image_dir)]))
+        for phase_name, flags in phases:
             phase[0] = phase_name
             result = subprocess.run(base + flags, text=True, capture_output=True, timeout=360)
             (out / (phase_name + '.jsonl')).write_text(result.stdout)

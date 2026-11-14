@@ -217,7 +217,7 @@ func TestRuntimeAPIHTTPSnapshotHandlers(t *testing.T) {
 	writeRuntimeAPITestFile(t, paths.VersionPath, localPythonSnapshotVersion(cfg.LocalPython)+"\n")
 	writeRuntimeAPITestFile(t, paths.WorkspacePath, "workspace")
 	var warmFiles []string
-	for _, profile := range []string{"numpy", "plot-agg"} {
+	for _, profile := range []string{"numpy", "plot-agg", "plot-cairo"} {
 		warmCfg := runtimeStorageWorkerConfig(pool, worker)
 		warmCfg.ImportProfile = profile
 		warm := localPythonSnapshotPathsForConfig(warmCfg)

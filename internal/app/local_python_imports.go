@@ -27,11 +27,15 @@ func localPythonWarmImports(profile string) string {
 		return ""
 	}
 	input := "import random, fcntl, struct\nimport numpy as __nats_numpy\nimport numpy.random\n"
-	if profile == pythonprofile.PlotAgg {
+	if profile == pythonprofile.PlotAgg || profile == pythonprofile.PlotCairo {
+		backend := "Agg"
+		if profile == pythonprofile.PlotCairo {
+			backend = "module://mplcairo.base"
+		}
 		input += "subprocess.run(['/usr/bin/mount', '-t', 'tmpfs', '-o', 'size=16m,mode=1777', 'tmpfs', '/tmp'], check=True)\n" +
 			"os.makedirs('/tmp/nats-plot-cache', mode=0o755, exist_ok=True)\n" +
 			"os.environ['MPLCONFIGDIR'] = '/tmp/nats-plot-cache'\n" +
-			"os.environ['MPLBACKEND'] = 'Agg'\n" +
+			"os.environ['MPLBACKEND'] = " + strconv.Quote(backend) + "\n" +
 			"import matplotlib.pyplot as __nats_pyplot\n" +
 			"__nats_figure = __nats_pyplot.figure(figsize=(1, 1))\n" +
 			"__nats_figure.text(0.1, 0.1, '0123456789')\n" +

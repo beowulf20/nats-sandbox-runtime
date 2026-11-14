@@ -53,8 +53,9 @@ type Client struct {
 }
 
 const (
-	ImportProfileNumPy   = pythonprofile.NumPy
-	ImportProfilePlotAgg = pythonprofile.PlotAgg
+	ImportProfileNumPy     = pythonprofile.NumPy
+	ImportProfilePlotAgg   = pythonprofile.PlotAgg
+	ImportProfilePlotCairo = pythonprofile.PlotCairo
 )
 
 // Request is the V0 byte-only runtime request.

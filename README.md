@@ -77,6 +77,13 @@ Generate related figures in one request to amortize restore and transfer costs.
 The benchmark in `scripts/python-bench` compares single plots, four-plot batches,
 import profiles and lossless PNG compression without changing application defaults.
 
+An experimental `plot-cairo` profile preloads the headless
+`module://mplcairo.base` renderer instead of Agg. It requires the optional
+`Dockerfile.guest-mplcairo` image derivative; the normal image and requirements
+remain unchanged. The Go SDK exposes `ImportProfilePlotCairo`. Compare renderer
+latency, memory, swap and visual output before selecting it: Cairo and Agg do not
+produce identical pixels. Neither profile switches renderer after restoring.
+
 An optional `Dockerfile.guest-python` builds a checksum-pinned CPython source
 release with PGO and LTO on top of an existing runtime image. The normal image
 continues to use Ubuntu's interpreter. For example:

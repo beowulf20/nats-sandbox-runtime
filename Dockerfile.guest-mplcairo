@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# Experimental renderer comparison image; never changes the normal image.
+ARG RUNTIME_IMAGE=nats-sandbox-runtime:local
+FROM ${RUNTIME_IMAGE} AS package
+USER root
+ARG MPLCAIRO_VERSION=0.6.1
+ARG GUEST_ROOTFS_SIZE=1536M
+RUN set -eu; \
+ mkdir /guest /out; \
+ debugfs -R 'rdump / /guest' /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4; \
+ cp /etc/resolv.conf /guest/etc/resolv.conf; \
+ for node in null zero random urandom; do rm -f /guest/dev/$node; cp -a /dev/$node /guest/dev/$node; done; \
+ chroot /guest /usr/bin/apt-get update; \
+ chroot /guest /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --no-install-recommends libcairo2 python3-cairo; \
+ chroot /guest /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir --no-deps --only-binary=:all: "mplcairo==${MPLCAIRO_VERSION}"; \
+ chroot /guest /usr/bin/python3 -m pip check; \
+ chroot /guest /usr/bin/python3 -c 'import importlib.metadata as m, cairo, mplcairo, matplotlib; matplotlib.use("module://mplcairo.base"); import matplotlib.pyplot as p; p.figure().canvas.draw(); print({n:m.version(n) for n in ("numpy","matplotlib","mplcairo","pycairo")}); print(cairo.cairo_version_string(), mplcairo.get_options())'; \
+ chroot /guest /usr/bin/python3 -m compileall -q /usr/local/lib/python3.12/dist-packages/mplcairo; \
+ chroot /guest /usr/bin/apt-get clean; \
+ rm -rf /guest/var/lib/apt/lists/* /guest/root/.cache; \
+ rm -f /guest/etc/resolv.conf; \
+ truncate -s "$GUEST_ROOTFS_SIZE" /out/rootfs.ext4; \
+ mkfs.ext4 -q -F -d /guest /out/rootfs.ext4; \
+ e2fsck -fy /out/rootfs.ext4; \
+ resize2fs -M /out/rootfs.ext4; \
+ e2fsck -fn /out/rootfs.ext4; \
+ sha256sum /out/rootfs.ext4 > /out/rootfs.ext4.sha256
+
+FROM ${RUNTIME_IMAGE}
+COPY --from=package /out/rootfs.ext4 /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4
+COPY --from=package /out/rootfs.ext4.sha256 /opt/nats-sandbox-runtime/firecracker-assets/rootfs.ext4.sha256
