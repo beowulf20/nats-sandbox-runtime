@@ -1,10 +1,12 @@
 package pyruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"nats-sandbox-runtime/internal/transfer"
 	"path"
 	"sort"
@@ -201,7 +203,7 @@ type requester interface {
 
 type objectStore interface {
 	PutBytes(ctx context.Context, name string, data []byte) (*jetstream.ObjectInfo, error)
-	GetBytes(ctx context.Context, name string, opts ...jetstream.GetObjectOpt) ([]byte, error)
+	Get(ctx context.Context, name string, opts ...jetstream.GetObjectOpt) (jetstream.ObjectResult, error)
 }
 
 type pythonRunRequest struct {
@@ -329,20 +331,50 @@ func downloadArtifacts(ctx context.Context, store objectStore, artifacts []pytho
 	var mu sync.Mutex
 	err := transfer.Parallel(ctx, len(checked), func(ctx context.Context, i int) error {
 		artifact := checked[i]
-		data, err := store.GetBytes(ctx, artifact.Object)
+		stream, err := store.Get(ctx, artifact.Object)
 		if err != nil {
 			return fmt.Errorf("download artifact %q: %w%s", artifact.Path, err, objectStoreConsumerDeletePermissionHint(err, cfg.Bucket))
 		}
-		if int64(len(data)) > cfg.MaxOutputFileBytes {
-			return SizeLimitError{Kind: "output_file", Path: artifact.Path, Size: int64(len(data)), Limit: cfg.MaxOutputFileBytes}
+		defer stream.Close()
+		info, err := stream.Info()
+		if err != nil {
+			return fmt.Errorf("read artifact metadata %q: %w", artifact.Path, err)
 		}
+		if info == nil || info.Size > uint64(^uint(0)>>1) {
+			return fmt.Errorf("invalid artifact size %q", artifact.Path)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		size := int64(info.Size)
+		if size > cfg.MaxOutputFileBytes {
+			return SizeLimitError{Kind: "output_file", Path: artifact.Path, Size: size, Limit: cfg.MaxOutputFileBytes}
+		}
+		// Reserve before allocating so parallel downloads cannot allocate their
+		// individual limits when the actual total exceeds the shared budget.
 		mu.Lock()
-		defer mu.Unlock()
-		downloadedTotal += int64(len(data))
-		if downloadedTotal > cfg.MaxOutputTotalBytes {
-			return SizeLimitError{Kind: "output_total", Size: downloadedTotal, Limit: cfg.MaxOutputTotalBytes}
+		next := downloadedTotal + size
+		if next < downloadedTotal {
+			next = 1<<63 - 1
 		}
-		downloads[i] = data
+		if size > cfg.MaxOutputTotalBytes-downloadedTotal {
+			mu.Unlock()
+			return SizeLimitError{Kind: "output_total", Size: next, Limit: cfg.MaxOutputTotalBytes}
+		}
+		downloadedTotal = next
+		mu.Unlock()
+		buffer := artifactBuffer{ctx: ctx, path: artifact.Path, cfg: cfg, reserved: size, total: &downloadedTotal, mu: &mu}
+		buffer.data.Grow(int(size))
+		// Do not use bytes.Buffer.ReadFrom: it grows again to probe EOF even
+		// when the complete object already fits the allocated buffer.
+		scratch := make([]byte, min(32*1024, max(512, int(size))))
+		if _, err := io.CopyBuffer(&buffer, stream, scratch); err != nil {
+			return fmt.Errorf("download artifact %q: %w%s", artifact.Path, err, objectStoreConsumerDeletePermissionHint(err, cfg.Bucket))
+		}
+		downloads[i] = buffer.data.Bytes()
+		if downloads[i] == nil {
+			downloads[i] = []byte{}
+		}
 		return nil
 	})
 	if err != nil {
@@ -353,6 +385,43 @@ func downloadArtifacts(ctx context.Context, store objectStore, artifacts []pytho
 		result[artifact.Path] = downloads[i]
 	}
 	return result, nil
+}
+
+type artifactBuffer struct {
+	data     bytes.Buffer
+	ctx      context.Context
+	path     string
+	cfg      Config
+	reserved int64
+	total    *int64
+	mu       *sync.Mutex
+}
+
+func (b *artifactBuffer) Write(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	size := int64(b.data.Len()) + int64(len(p))
+	if size > b.cfg.MaxOutputFileBytes {
+		return 0, SizeLimitError{Kind: "output_file", Path: b.path, Size: size, Limit: b.cfg.MaxOutputFileBytes}
+	}
+	// Metadata is a size hint. Enforce actual bytes too, including concurrent
+	// readers whose objects contain more data than their metadata advertises.
+	if extra := size - b.reserved; extra > 0 {
+		b.mu.Lock()
+		next := *b.total + extra
+		if next < *b.total {
+			next = 1<<63 - 1
+		}
+		if extra > b.cfg.MaxOutputTotalBytes-*b.total {
+			b.mu.Unlock()
+			return 0, SizeLimitError{Kind: "output_total", Size: next, Limit: b.cfg.MaxOutputTotalBytes}
+		}
+		*b.total = next
+		b.reserved = size
+		b.mu.Unlock()
+	}
+	return b.data.Write(p)
 }
 
 func objectStoreConsumerDeletePermissionHint(err error, bucket string) string {

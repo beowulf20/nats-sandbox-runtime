@@ -54,6 +54,7 @@ type LocalPythonConfig struct {
 	InlineCommand          string
 	ExecFilePath           string
 	HideFirecrackerLog     bool
+	SparseBootSnapshot     bool
 	MemoryMiB              int64
 	SwapMiB                int64
 	WorkspaceMiB           int64
@@ -224,6 +225,7 @@ func addLocalPythonFlags(cmd *cobra.Command, cfg *LocalPythonConfig) {
 	cmd.Flags().StringVarP(&cfg.InlineCommand, "exec", "e", cfg.InlineCommand, "inline Python command to run instead of starting a REPL")
 	cmd.Flags().StringVar(&cfg.ExecFilePath, "exec-file", cfg.ExecFilePath, "Python script file to run instead of starting a REPL")
 	cmd.Flags().BoolVar(&cfg.HideFirecrackerLog, "hide-firecracker-log", cfg.HideFirecrackerLog, "hide Firecracker process logs")
+	cmd.Flags().BoolVar(&cfg.SparseBootSnapshot, "sparse-boot-snapshot", cfg.SparseBootSnapshot, "experimental sparse snapshot of the fresh boot VM; full snapshots remain the default")
 	cmd.Flags().Int64Var(&cfg.MemoryMiB, "memory-mib", cfg.MemoryMiB, "microVM memory size in MiB")
 	cmd.Flags().Int64Var(&cfg.SwapMiB, "swap-mib", cfg.SwapMiB, "dedicated guest swap image size in MiB")
 	cmd.Flags().Int64Var(&cfg.WorkspaceMiB, "workspace-mib", cfg.WorkspaceMiB, "workspace filesystem size in MiB")
@@ -383,6 +385,7 @@ func addRuntimePythonFlags(cmd *cobra.Command, runtimeCfg *RuntimePythonConfig) 
 	cmd.Flags().StringVar(&runtimeCfg.LocalPython.RootfsPath, "rootfs", runtimeCfg.LocalPython.RootfsPath, "Firecracker rootfs path")
 	cmd.Flags().StringVar(&runtimeCfg.LocalPython.FirecrackerPath, "firecracker", runtimeCfg.LocalPython.FirecrackerPath, "Firecracker binary path")
 	cmd.Flags().BoolVar(&runtimeCfg.LocalPython.HideFirecrackerLog, "hide-firecracker-log", runtimeCfg.LocalPython.HideFirecrackerLog, "hide Firecracker process logs")
+	cmd.Flags().BoolVar(&runtimeCfg.LocalPython.SparseBootSnapshot, "sparse-boot-snapshot", runtimeCfg.LocalPython.SparseBootSnapshot, "experimental sparse snapshot of the fresh boot VM; full snapshots remain the default")
 	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.MemoryMiB, "memory-mib", runtimeCfg.LocalPython.MemoryMiB, "default microVM memory size in MiB")
 	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.SwapMiB, "swap-mib", runtimeCfg.LocalPython.SwapMiB, "default dedicated guest swap image size in MiB")
 	cmd.Flags().Int64Var(&runtimeCfg.LocalPython.WorkspaceMiB, "workspace-mib", runtimeCfg.LocalPython.WorkspaceMiB, "default workspace filesystem size in MiB")

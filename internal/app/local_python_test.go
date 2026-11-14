@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -87,6 +88,104 @@ func TestLocalPythonVMConfigUsesKernelRootfsAndMemory(t *testing.T) {
 	}
 	if got.BootSource.BootArgs == "" {
 		t.Fatal("boot args are empty")
+	}
+}
+
+func TestSparseBootSnapshotTrackingAndCacheIsolation(t *testing.T) {
+	full := defaultLocalPythonConfig()
+	sparse := full
+	sparse.SparseBootSnapshot = true
+	paths := localPythonSnapshotPaths(t.TempDir())
+	if localPythonVMConfig(full, paths, 0).MachineConfig.TrackDirtyPages {
+		t.Fatal("full snapshots unexpectedly enable dirty-page tracking")
+	}
+	if !localPythonVMConfig(sparse, paths, 0).MachineConfig.TrackDirtyPages {
+		t.Fatal("sparse boot snapshot does not track pages dirtied during boot")
+	}
+	for _, path := range []string{paths.StatePath, paths.MemoryPath} {
+		if err := os.WriteFile(path, []byte("snapshot"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	full.SwapMiB, sparse.SwapMiB = 0, 0
+	for _, cfg := range []LocalPythonConfig{full, sparse} {
+		if err := os.WriteFile(paths.VersionPath, []byte(localPythonSnapshotVersion(cfg)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if check := localPythonSnapshotCheck(paths, cfg); !check.OK {
+			t.Fatal(check.Reason)
+		}
+		other := cfg
+		other.SparseBootSnapshot = !cfg.SparseBootSnapshot
+		if localPythonSnapshotCheck(paths, other).OK {
+			t.Fatal("full and sparse modes reused the same cache")
+		}
+	}
+}
+
+func TestLocalPythonWorkspaceRecoveryFailurePreservesFiles(t *testing.T) {
+	if _, err := exec.LookPath("e2fsck"); err != nil {
+		t.Skip("e2fsck is required")
+	}
+	dir := t.TempDir()
+	workspace := filepath.Join(dir, "workspace")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "retained"), []byte("valid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	image := filepath.Join(dir, "invalid.ext4")
+	if err := os.WriteFile(image, []byte("not a filesystem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := syncLocalPythonWorkspaceImage(t.Context(), LocalPythonConfig{WorkspaceDir: workspace}, localPythonSnapshotFiles{WorkspacePath: image})
+	if err == nil || !strings.Contains(err.Error(), "recover workspace journal") {
+		t.Fatalf("error=%v, want failed recovery", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(workspace, "retained"))
+	if string(data) != "valid" {
+		t.Fatal("failed recovery replaced valid files")
+	}
+}
+
+func TestLocalPythonWorkspaceJournalReplayFixture(t *testing.T) {
+	fixture := os.Getenv("NATS_RUNTIME_JOURNAL_FIXTURE")
+	if fixture == "" {
+		t.Skip("set NATS_RUNTIME_JOURNAL_FIXTURE to an unclean KVM workspace with committed outputs/metrics.json")
+	}
+	in, err := os.Open(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	image := filepath.Join(t.TempDir(), "workspace.ext4")
+	out, err := os.Create(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		t.Fatalf("copy=%v close=%v", copyErr, closeErr)
+	}
+	before, err := exec.CommandContext(t.Context(), "debugfs", "-R", "cat /outputs/metrics.json", image).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json.Valid(before) {
+		t.Fatal("fixture is already checkpointed; it cannot exercise journal recovery")
+	}
+	workspace := t.TempDir()
+	if err := syncLocalPythonWorkspaceImage(t.Context(), LocalPythonConfig{WorkspaceDir: workspace}, localPythonSnapshotFiles{WorkspacePath: image}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(workspace, "outputs/metrics.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("committed artifact was not recovered: %q", data)
 	}
 }
 

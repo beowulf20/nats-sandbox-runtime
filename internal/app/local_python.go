@@ -40,8 +40,9 @@ type firecrackerDrive struct {
 }
 
 type firecrackerMachineConfig struct {
-	VcpuCount  int64 `json:"vcpu_count"`
-	MemSizeMiB int64 `json:"mem_size_mib"`
+	VcpuCount       int64 `json:"vcpu_count"`
+	MemSizeMiB      int64 `json:"mem_size_mib"`
+	TrackDirtyPages bool  `json:"track_dirty_pages,omitempty"`
 }
 
 const (
@@ -276,8 +277,14 @@ func ensureLocalPythonSnapshot(ctx context.Context, cfg LocalPythonConfig, paths
 	if err := firecrackerAPIRequest(startupCtx, apiSock, http.MethodPatch, "/vm", map[string]string{"state": "Paused"}); err != nil {
 		return fmt.Errorf("pause snapshot VM: %w", err)
 	}
+	snapshotType := "Full"
+	if cfg.SparseBootSnapshot {
+		// A Diff taken from a fresh boot is independently resumable: no earlier
+		// snapshot exists or needs merging. Never create an incremental chain.
+		snapshotType = "Diff"
+	}
 	if err := firecrackerAPIRequest(startupCtx, apiSock, http.MethodPut, "/snapshot/create", map[string]string{
-		"snapshot_type": "Full",
+		"snapshot_type": snapshotType,
 		"snapshot_path": paths.StatePath,
 		"mem_file_path": paths.MemoryPath,
 	}); err != nil {
@@ -551,6 +558,15 @@ func isInvalidLocalPythonSnapshotLoadError(err error) bool {
 }
 
 func syncLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig, paths localPythonSnapshotFiles) error {
+	// The VM has stopped, but sync() only guarantees a committed journal. Raw
+	// debugfs reads do not replay it and can otherwise export missing/empty files.
+	cmd := exec.CommandContext(ctx, "e2fsck", "-p", "-E", "journal_only", paths.WorkspacePath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return fmt.Errorf("recover workspace journal: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+	}
 	workspaceParent := filepath.Dir(cfg.WorkspaceDir)
 	if err := os.MkdirAll(workspaceParent, 0o755); err != nil {
 		return fmt.Errorf("create workspace parent dir: %w", err)
@@ -565,7 +581,7 @@ func syncLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig, p
 			_ = os.RemoveAll(syncDir)
 		}
 	}()
-	cmd := exec.CommandContext(ctx, "debugfs", "-R", "rdump / "+syncDir, paths.WorkspacePath)
+	cmd = exec.CommandContext(ctx, "debugfs", "-R", "rdump / "+syncDir, paths.WorkspacePath)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("sync workspace image: %w: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -1088,7 +1104,11 @@ func localPythonSnapshotVersion(cfg LocalPythonConfig) string {
 	if resolved, err := exec.LookPath(firecracker); err == nil {
 		firecracker = resolved
 	}
-	return fmt.Sprintf("workspace-v8 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 root_device_ro=1 workspace_mount=on_restore user_uid=65534 kernel=%s rootfs=%s firecracker=%s", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB, localPythonSnapshotAssetVersion(cfg.KernelPath), localPythonSnapshotRootfsVersion(cfg.RootfsPath), localPythonSnapshotAssetVersion(firecracker))
+	version := fmt.Sprintf("workspace-v8 memory_mib=%d vcpus=%d swap_mib=%d workspace_mib=%d drive_fd=1 system_ro=1 root_device_ro=1 workspace_mount=on_restore user_uid=65534 kernel=%s rootfs=%s firecracker=%s", cfg.MemoryMiB, cfg.VCPUs, cfg.SwapMiB, cfg.WorkspaceMiB, localPythonSnapshotAssetVersion(cfg.KernelPath), localPythonSnapshotRootfsVersion(cfg.RootfsPath), localPythonSnapshotAssetVersion(firecracker))
+	if cfg.SparseBootSnapshot {
+		version += " sparse_boot_snapshot=1"
+	}
+	return version
 }
 
 func localPythonSnapshotAssetVersion(path string) string {
@@ -1324,8 +1344,9 @@ func localPythonVMConfig(cfg LocalPythonConfig, paths localPythonSnapshotFiles, 
 		},
 		Drives: drives,
 		MachineConfig: firecrackerMachineConfig{
-			VcpuCount:  cfg.VCPUs,
-			MemSizeMiB: cfg.MemoryMiB,
+			VcpuCount:       cfg.VCPUs,
+			MemSizeMiB:      cfg.MemoryMiB,
+			TrackDirtyPages: cfg.SparseBootSnapshot,
 		},
 	}
 }

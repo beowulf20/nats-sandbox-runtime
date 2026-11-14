@@ -44,6 +44,11 @@ The build downloads the Firecracker release binary and Firecracker CI guest asse
 
 Python modules available inside the Firecracker guest are declared in the repo-root `requirements.txt`; the Docker build installs those requirements into the packaged guest rootfs.
 
+`GUEST_ROOTFS_SIZE` is the filesystem capacity used while preparing the guest.
+The build checks and shrinks the completed read-only filesystem before computing
+its checksum and copying it into the final image. The packaged root disk can
+therefore be smaller than that preparation capacity.
+
 The image defaults to `runtime api`, listens on `0.0.0.0:8080`, and expects a NATS server named `nats` with JetStream enabled.
 
 ```bash
@@ -261,6 +266,14 @@ Requests may include `"artifact_exclude_prefixes": ["artifacts/"]` to omit an in
 
 Runtime fetches/publications and SDK uploads/downloads share a limit of four concurrent transfers per process. Manifests stay sorted regardless of completion order. On failure, pending transfers are cancelled and started transfers joined; no partial successful result is returned. Already published objects remain subject to normal retention.
 
+Input downloads stream into temporary files confined to the workspace and replace
+destinations only after a complete, validated transfer. This also truncates shorter
+replacement inputs correctly. Each input is bounded by the effective workspace
+capacity; the full workspace limit is checked again before execution.
+After a VM stops, the runtime replays its workspace journal before reading files
+with `debugfs`, so committed guest writes are visible to artifact export and the
+next request. A failed journal replay returns an error instead of partial output.
+
 Run a simple inline script:
 
 ```bash
@@ -340,6 +353,13 @@ Stdout and stderr are returned as base64 NATS headers:
 ## Go SDK V0
 
 The `pkg/pyruntime` SDK wraps the byte-only V0 flow for Go callers. It uploads input bytes to the runtime Object Store bucket, calls `python.run`, and downloads every returned workspace artifact into memory.
+
+Downloads reserve their bounded allocation from Object Store metadata and enforce
+per-file and aggregate byte limits while streaming, including bodies larger than
+their metadata advertises. Streams are consumed through EOF for digest validation.
+Ordinary downloads allocate once from metadata instead of repeatedly growing a
+whole-file buffer. The V0 result still retains the returned file bytes, which
+callers must include in their memory budget.
 
 ```go
 package main
@@ -489,6 +509,17 @@ large root disk into a fresh container's writable layer on its first request.
 Snapshots leave the workspace unmounted. Each restored VM discards cached
 workspace block pages and mounts the current request's disk before dropping
 privileges, so filesystem metadata from a previous image is not reused.
+
+Full snapshots remain the default. `--sparse-boot-snapshot` is an experimental
+opt-in for `local python`, `runtime python` and `runtime api`: it tracks pages
+while booting the initial VM and saves a sparse, independently resumable boot
+snapshot. It does not create an incremental snapshot chain. Dirty tracking is
+disabled on ordinary restores, which retain on-demand file-backed loading.
+Full and sparse modes use different cache identities; thread workspaces are
+preserved when switching modes. Validate the opt-in with the pinned Firecracker
+version and representative KVM workloads before enabling it on a deployment.
+See the [Firecracker 1.14 snapshot documentation](https://github.com/firecracker-microvm/firecracker/blob/v1.14.0/docs/snapshotting/snapshot-support.md).
+
 Roll out the rebuilt image with its guest assets, rather than replacing only the
 runtime binary in an older image. Snapshots made with a writable root device are
 automatically invalidated; thread workspaces are preserved.

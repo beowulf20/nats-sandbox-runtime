@@ -1,11 +1,13 @@
 package pyruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"sort"
 	"strings"
@@ -315,11 +317,13 @@ func (r *fakeRequester) RequestWithContext(_ context.Context, subject string, da
 }
 
 type fakeStore struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	puts    []string
-	gets    []string
-	getErr  error
+	mu        sync.Mutex
+	objects   map[string][]byte
+	puts      []string
+	gets      []string
+	getErr    error
+	sizeHints map[string]uint64
+	streams   []*fakeObjectResult
 }
 
 func newFakeStore() *fakeStore {
@@ -334,7 +338,7 @@ func (s *fakeStore) PutBytes(_ context.Context, name string, data []byte) (*jets
 	return nil, nil
 }
 
-func (s *fakeStore) GetBytes(_ context.Context, name string, _ ...jetstream.GetObjectOpt) ([]byte, error) {
+func (s *fakeStore) Get(_ context.Context, name string, _ ...jetstream.GetObjectOpt) (jetstream.ObjectResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gets = append(s.gets, name)
@@ -345,7 +349,87 @@ func (s *fakeStore) GetBytes(_ context.Context, name string, _ ...jetstream.GetO
 	if !ok {
 		return nil, fmt.Errorf("object %q not found", name)
 	}
-	return append([]byte(nil), data...), nil
+	size := uint64(len(data))
+	if hint, ok := s.sizeHints[name]; ok {
+		size = hint
+	}
+	stream := &fakeObjectResult{Reader: bytes.NewReader(data), size: size}
+	s.streams = append(s.streams, stream)
+	return stream, nil
+}
+
+type fakeObjectResult struct {
+	io.Reader
+	size   uint64
+	closed bool
+}
+
+func (r *fakeObjectResult) Info() (*jetstream.ObjectInfo, error) {
+	return &jetstream.ObjectInfo{Size: r.size}, nil
+}
+func (r *fakeObjectResult) Error() error { return nil }
+func (r *fakeObjectResult) Close() error { r.closed = true; return nil }
+
+func TestDownloadsEnforceActualBytesWithUnderstatedObjectMetadata(t *testing.T) {
+	store := newFakeStore()
+	store.objects["a"], store.objects["b"] = []byte("abc"), []byte("def")
+	store.sizeHints = map[string]uint64{"a": 1, "b": 1}
+	files, err := downloadArtifacts(t.Context(), store, []pythonRunArtifact{{Path: "a", Object: "a", Size: 1}, {Path: "b", Object: "b", Size: 1}}, withDefaults(Config{MaxOutputFileBytes: 4, MaxOutputTotalBytes: 5}))
+	var limit SizeLimitError
+	if files != nil || !errors.As(err, &limit) || limit.Kind != "output_total" || limit.Size != 6 {
+		t.Fatalf("files=%v err=%v, want actual total rejection", files, err)
+	}
+	for _, stream := range store.streams {
+		if !stream.closed {
+			t.Fatal("failed transfer left an object stream open")
+		}
+	}
+}
+
+func TestDownloadChecksRealObjectMetadataBeforeAllocating(t *testing.T) {
+	store := newFakeStore()
+	store.objects["a"] = []byte("abc")
+	files, err := downloadArtifacts(t.Context(), store, []pythonRunArtifact{{Path: "a", Object: "a", Size: 1}}, withDefaults(Config{MaxOutputFileBytes: 2}))
+	var limit SizeLimitError
+	if files != nil || !errors.As(err, &limit) || limit.Kind != "output_file" || !store.streams[0].closed {
+		t.Fatalf("files=%v err=%v, want closed stream and actual file limit", files, err)
+	}
+}
+
+type failingObjectStore struct {
+	*fakeStore
+	stream *fakeObjectResult
+}
+
+func (s failingObjectStore) Get(context.Context, string, ...jetstream.GetObjectOpt) (jetstream.ObjectResult, error) {
+	return s.stream, nil
+}
+
+type failureReader struct{ err error }
+
+func (r failureReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestDownloadRequiresSuccessfulStreamEOF(t *testing.T) {
+	checksumErr := errors.New("object digest mismatch")
+	stream := &fakeObjectResult{Reader: io.MultiReader(strings.NewReader("data"), failureReader{checksumErr}), size: 4}
+	store := failingObjectStore{newFakeStore(), stream}
+	files, err := downloadArtifacts(t.Context(), store, []pythonRunArtifact{{Path: "a", Object: "a", Size: 4}}, withDefaults(Config{}))
+	if files != nil || !errors.Is(err, checksumErr) || !stream.closed {
+		t.Fatalf("files=%v err=%v closed=%t", files, err, stream.closed)
+	}
+}
+
+func TestDownloadPreservesAnEmptyFile(t *testing.T) {
+	store := newFakeStore()
+	store.objects["empty"] = []byte{}
+	files, err := downloadArtifacts(t.Context(), store, []pythonRunArtifact{{Path: "empty", Object: "empty", Size: 0}}, withDefaults(Config{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ok := files["empty"]
+	if !ok || data == nil || len(data) != 0 {
+		t.Fatalf("empty file lost byte-slice semantics: present=%t data=%#v", ok, data)
+	}
 }
 
 func newTestClient(cfg Config) *Client {
