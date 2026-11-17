@@ -138,7 +138,7 @@ The runtime binary and container entrypoint both read these environment variable
 | `NATS_RUNTIME_FIRECRACKER` | `/usr/local/bin/firecracker` | `--firecracker` | Firecracker binary path. |
 | `NATS_RUNTIME_MEMORY_MIB` | `128` | `--memory-mib` | Default guest memory per run. |
 | `NATS_RUNTIME_SWAP_MIB` | `256` | `--swap-mib` | Default dedicated guest swap size. |
-| `NATS_RUNTIME_WORKSPACE_MIB` | `16` | `--workspace-mib` | Default writable `/workspace` ext4 size. |
+| `NATS_RUNTIME_WORKSPACE_MIB` | `32` | `--workspace-mib` | Default writable `/workspace` ext4 size. |
 | `NATS_RUNTIME_VCPUS` | `1` | `--vcpus` | Guest vCPU count. |
 | `NATS_RUNTIME_MAX_VCPUS` | `1` | `--max-vcpus` | Hard cap for requested vCPUs. |
 | `NATS_RUNTIME_EXEC_TIMEOUT` | `5s` | `--exec-timeout` | Default Python execution timeout. |

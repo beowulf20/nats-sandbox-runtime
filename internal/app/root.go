@@ -27,7 +27,7 @@ const (
 	defaultExecTimeout      = 5 * time.Second
 	defaultSwapMiB          = 256
 	defaultParallelRuns     = 1
-	defaultWorkspaceMiB     = 16
+	defaultWorkspaceMiB     = 32
 	defaultRuntimeBucket    = "python-runtime-workspaces"
 	defaultArtifactTTL      = 24 * time.Hour
 	defaultArtifactCleanup  = time.Hour

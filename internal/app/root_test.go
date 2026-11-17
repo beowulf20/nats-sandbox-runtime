@@ -95,8 +95,8 @@ func TestLocalPythonCommandUsesDefaultAssetsAndInteractivePython(t *testing.T) {
 	if got.SwapMiB != 256 {
 		t.Fatalf("SwapMiB = %d, want 256", got.SwapMiB)
 	}
-	if got.WorkspaceMiB != 16 {
-		t.Fatalf("WorkspaceMiB = %d, want 16", got.WorkspaceMiB)
+	if got.WorkspaceMiB != 32 {
+		t.Fatalf("WorkspaceMiB = %d, want 32", got.WorkspaceMiB)
 	}
 	if got.VCPUs != 1 {
 		t.Fatalf("VCPUs = %d, want 1", got.VCPUs)

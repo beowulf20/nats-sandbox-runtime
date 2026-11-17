@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -188,6 +189,38 @@ func TestEnsureLocalPythonWorkspaceImageRejectsContentAboveConfiguredSize(t *tes
 	}, paths)
 	if err == nil || !strings.Contains(err.Error(), "exceeding workspace-mib limit of 1 MiB") {
 		t.Fatalf("ensureLocalPythonWorkspaceImage error = %v, want workspace size limit error", err)
+	}
+}
+
+func TestWorkspaceImageSurvivesFormatterCapacityFailure(t *testing.T) {
+	requireCommand(t, "mke2fs")
+	dir := t.TempDir()
+	cfg := LocalPythonConfig{WorkspaceDir: filepath.Join(dir, "inputs"), WorkspaceMiB: 16}
+	paths := localPythonSnapshotPaths(filepath.Join(dir, "snapshot"))
+	if err := ensureLocalPythonWorkspaceImage(t.Context(), cfg, paths); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(paths.WorkspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// These 75 files fit the nominal limit but leave too little space for ext4.
+	payload := bytes.Repeat([]byte("x"), 199008)
+	for i := range 75 {
+		if err := os.WriteFile(filepath.Join(cfg.WorkspaceDir, fmt.Sprintf("%02d.json", i)), payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ensureLocalPythonWorkspaceImage(t.Context(), cfg, paths); err == nil || !strings.Contains(err.Error(), "filesystem overhead") {
+		t.Fatalf("expected formatter capacity failure, got %v", err)
+	}
+	after, err := os.ReadFile(paths.WorkspacePath)
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("last good workspace image was lost: %v", err)
+	}
+	cfg.WorkspaceMiB = 32
+	if err := ensureLocalPythonWorkspaceImage(t.Context(), cfg, paths); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -328,10 +328,20 @@ func ensureLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig,
 	if sizeBytes > sizeBytesLimit {
 		return fmt.Errorf("workspace files use %d bytes, exceeding workspace-mib limit of %d MiB", sizeBytes, cfg.WorkspaceMiB)
 	}
-	_ = os.Remove(paths.WorkspacePath)
-	cmd := exec.CommandContext(ctx, "mke2fs", "-q", "-t", "ext4", "-b", "1024", "-F", "-d", cfg.WorkspaceDir, paths.WorkspacePath, strconv.FormatInt(cfg.WorkspaceMiB*1024, 10))
+	image, err := os.CreateTemp(filepath.Dir(paths.WorkspacePath), ".workspace-*.ext4")
+	if err != nil {
+		return fmt.Errorf("create temporary workspace image: %w", err)
+	}
+	defer os.Remove(image.Name())
+	if err := image.Close(); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "mke2fs", "-q", "-t", "ext4", "-b", "1024", "-F", "-d", cfg.WorkspaceDir, image.Name(), strconv.FormatInt(cfg.WorkspaceMiB*1024, 10))
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("create workspace ext4 image: %w: %s", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("create workspace ext4 image (%d bytes of files, %d MiB including filesystem overhead): %w: %s", sizeBytes, cfg.WorkspaceMiB, err, strings.TrimSpace(string(output)))
+	}
+	if err := os.Rename(image.Name(), paths.WorkspacePath); err != nil {
+		return fmt.Errorf("publish workspace ext4 image: %w", err)
 	}
 	return nil
 }

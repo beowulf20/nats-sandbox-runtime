@@ -111,6 +111,7 @@ COPY --from=firecracker-assets /out/vmlinux.bin ./firecracker-assets/vmlinux.bin
 COPY --from=firecracker-assets /out/rootfs.ext4 ./firecracker-assets/rootfs.ext4
 COPY --from=firecracker-assets /out/rootfs.ext4.sha256 ./firecracker-assets/rootfs.ext4.sha256
 
+ENV NATS_RUNTIME_WORKSPACE_MIB=32
 COPY --chmod=0755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8080
