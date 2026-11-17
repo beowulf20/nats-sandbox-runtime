@@ -315,10 +315,19 @@ func TestNATSPanicFailureAndInvalidPrefixReleaseWorker(t *testing.T) {
 		if strings.Contains(cfg.InlineCommand, "panic-fixture") {
 			panic("private panic fixture")
 		}
+		if strings.Contains(cfg.InlineCommand, "capacity-fixture") {
+			return LocalPythonExecResult{}, &workspaceCapacityError{fileBytes: 15571461, limitMiB: 16, cause: errors.New("private path")}
+		}
 		return LocalPythonExecResult{}, errors.New("private failure fixture")
 	})
-	for _, code := range []string{"panic-fixture", "failure-fixture"} {
+	for code, category := range map[string]string{"panic-fixture": "execution_failed", "failure-fixture": "execution_failed", "capacity-fixture": "workspace_full"} {
 		msg := awaitReply(t, asyncPython(nc, "same", code), "500")
+		if got := msg.Header.Get("Nats-Sandbox-Runtime-Error-Code"); got != category {
+			t.Fatalf("runtime error code = %q, want %q", got, category)
+		}
+		if category == "workspace_full" && !strings.Contains(msg.Header.Get(micro.ErrorHeader), "15571461 bytes of files do not fit in 16 MiB") {
+			t.Fatalf("capacity description = %q", msg.Header.Get(micro.ErrorHeader))
+		}
 		if strings.Contains(msg.Header.Get(micro.ErrorHeader), "private") {
 			t.Fatal("private cause leaked")
 		}

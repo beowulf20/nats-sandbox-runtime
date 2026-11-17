@@ -187,7 +187,8 @@ func TestEnsureLocalPythonWorkspaceImageRejectsContentAboveConfiguredSize(t *tes
 		WorkspaceDir: workspaceDir,
 		WorkspaceMiB: 1,
 	}, paths)
-	if err == nil || !strings.Contains(err.Error(), "exceeding workspace-mib limit of 1 MiB") {
+	var capacity *workspaceCapacityError
+	if !errors.As(err, &capacity) || capacity.limitMiB != 1 || capacity.fileBytes != 2*1024*1024 {
 		t.Fatalf("ensureLocalPythonWorkspaceImage error = %v, want workspace size limit error", err)
 	}
 }
@@ -211,7 +212,8 @@ func TestWorkspaceImageSurvivesFormatterCapacityFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := ensureLocalPythonWorkspaceImage(t.Context(), cfg, paths); err == nil || !strings.Contains(err.Error(), "filesystem overhead") {
+	var capacity *workspaceCapacityError
+	if err := ensureLocalPythonWorkspaceImage(t.Context(), cfg, paths); !errors.As(err, &capacity) || capacity.cause == nil {
 		t.Fatalf("expected formatter capacity failure, got %v", err)
 	}
 	after, err := os.ReadFile(paths.WorkspacePath)

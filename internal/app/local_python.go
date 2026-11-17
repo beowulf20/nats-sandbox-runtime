@@ -313,6 +313,25 @@ func invalidateLocalPythonSnapshot(paths localPythonSnapshotFiles) error {
 	return nil
 }
 
+type workspaceCapacityError struct {
+	fileBytes int64
+	limitMiB  int64
+	cause     error
+}
+
+func (e *workspaceCapacityError) publicMessage() string {
+	return fmt.Sprintf("workspace full: %d bytes of files do not fit in %d MiB including filesystem overhead", e.fileBytes, e.limitMiB)
+}
+
+func (e *workspaceCapacityError) Error() string {
+	if e.cause != nil {
+		return e.publicMessage() + ": " + e.cause.Error()
+	}
+	return e.publicMessage()
+}
+
+func (e *workspaceCapacityError) Unwrap() error { return e.cause }
+
 func ensureLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig, paths localPythonSnapshotFiles) error {
 	if err := os.MkdirAll(cfg.WorkspaceDir, 0o755); err != nil {
 		return fmt.Errorf("create workspace dir: %w", err)
@@ -326,7 +345,7 @@ func ensureLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig,
 	}
 	sizeBytesLimit := cfg.WorkspaceMiB * 1024 * 1024
 	if sizeBytes > sizeBytesLimit {
-		return fmt.Errorf("workspace files use %d bytes, exceeding workspace-mib limit of %d MiB", sizeBytes, cfg.WorkspaceMiB)
+		return &workspaceCapacityError{fileBytes: sizeBytes, limitMiB: cfg.WorkspaceMiB}
 	}
 	image, err := os.CreateTemp(filepath.Dir(paths.WorkspacePath), ".workspace-*.ext4")
 	if err != nil {
@@ -337,8 +356,15 @@ func ensureLocalPythonWorkspaceImage(ctx context.Context, cfg LocalPythonConfig,
 		return err
 	}
 	cmd := exec.CommandContext(ctx, "mke2fs", "-q", "-t", "ext4", "-b", "1024", "-F", "-d", cfg.WorkspaceDir, image.Name(), strconv.FormatInt(cfg.WorkspaceMiB*1024, 10))
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("create workspace ext4 image (%d bytes of files, %d MiB including filesystem overhead): %w: %s", sizeBytes, cfg.WorkspaceMiB, err, strings.TrimSpace(string(output)))
+		cause := fmt.Errorf("create workspace ext4 image: %w: %s", err, strings.TrimSpace(string(output)))
+		// e2fsprogs reports ext4 block and inode exhaustion on stderr.
+		if bytes.Contains(output, []byte("Could not allocate block in ext2 filesystem")) ||
+			bytes.Contains(output, []byte("Could not allocate inode in ext2 filesystem")) {
+			return &workspaceCapacityError{fileBytes: sizeBytes, limitMiB: cfg.WorkspaceMiB, cause: cause}
+		}
+		return cause
 	}
 	if err := os.Rename(image.Name(), paths.WorkspacePath); err != nil {
 		return fmt.Errorf("publish workspace ext4 image: %w", err)

@@ -316,10 +316,19 @@ func registerRuntimePythonControlPlaneEndpoints(srv micro.Service, runtime *runt
 	return nil
 }
 
+// The standard micro status and description remain readable by older clients.
+func replyPythonRunError(req micro.Request, status, category, description string, headers nats.Header) {
+	if headers == nil {
+		headers = nats.Header{}
+	}
+	headers.Set("Nats-Sandbox-Runtime-Error-Code", category)
+	_ = req.Error(status, description, nil, micro.WithHeaders(micro.Headers(headers)))
+}
+
 func (s *runtimePythonService) handleRun(ctx context.Context, req micro.Request) {
 	worker, ok := s.admit()
 	if !ok {
-		_ = req.Error("503", "python runtime is busy", nil)
+		replyPythonRunError(req, "503", "runtime_busy", "python runtime is busy", nil)
 		return
 	}
 	defer s.jobs.Done()
@@ -331,13 +340,14 @@ func (s *runtimePythonService) handleAccepted(ctx context.Context, req micro.Req
 	started := time.Now()
 	failed := false
 	attempted := false
+	var runReq PythonRunRequest
 	defer func() {
 		if cause := recover(); cause != nil {
 			failed = true
-			runtimeTelemetry(s.cfg).Logger.ErrorContext(ctx, "runtime panic", "cause", fmt.Sprint(cause), "worker_id", worker.ID)
+			runtimeTelemetry(s.cfg).Logger.ErrorContext(ctx, "runtime panic", "cause", fmt.Sprint(cause), "run_id", runReq.RunID, "worker_id", worker.ID)
 			if !attempted {
 				attempted = true
-				_ = req.Error("500", "python runtime execution failed", nil)
+				replyPythonRunError(req, "500", "execution_failed", "python runtime execution failed", nil)
 			}
 		}
 		s.mu.Lock()
@@ -349,19 +359,18 @@ func (s *runtimePythonService) handleAccepted(ctx context.Context, req micro.Req
 		s.stats.ProcessingTimeNS += time.Since(started).Nanoseconds()
 		s.mu.Unlock()
 	}()
-	var runReq PythonRunRequest
 	if len(req.Data()) > 0 {
 		if err := json.Unmarshal(req.Data(), &runReq); err != nil {
 			failed = true
 			attempted = true
-			_ = req.Error("400", "invalid python run request", nil)
+			replyPythonRunError(req, "400", "invalid_request", "invalid python run request", nil)
 			return
 		}
 	}
 	if _, err := transfer.Prefixes(runReq.ArtifactExcludePrefixes); err != nil {
 		failed = true
 		attempted = true
-		_ = req.Error("400", "invalid artifact exclusion prefixes", nil)
+		replyPythonRunError(req, "400", "invalid_request", "invalid artifact exclusion prefixes", nil)
 		return
 	}
 	if runReq.RunID == "" {
@@ -372,7 +381,12 @@ func (s *runtimePythonService) handleAccepted(ctx context.Context, req micro.Req
 		failed = true
 		runtimeTelemetry(s.cfg).Logger.ErrorContext(ctx, "runtime execution failed", "error", err, "run_id", runReq.RunID, "thread_id", runReq.ThreadID, "worker_id", worker.ID)
 		attempted = true
-		_ = req.Error("500", "python runtime execution failed", nil, micro.WithHeaders(micro.Headers(s.logHeaders(stdout, stderr))))
+		category, description := "execution_failed", "python runtime execution failed"
+		var capacity *workspaceCapacityError
+		if errors.As(err, &capacity) {
+			category, description = "workspace_full", capacity.publicMessage()
+		}
+		replyPythonRunError(req, "500", category, description, s.logHeaders(stdout, stderr))
 		return
 	}
 	attempted = true
